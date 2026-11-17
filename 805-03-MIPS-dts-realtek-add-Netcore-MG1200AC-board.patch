@@ -1,0 +1,351 @@
+From 46cb65d1ffa40550788d4e7a041bc118e19c26d3 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 21 Sep 2026 04:08:13 +0800
+Subject: [PATCH 3/3] MIPS: dts: realtek: add Netcore MG1200AC board
+
+The Netcore MG1200AC is an RTL8197F router with 128 MiB of DDR2, a
+Winbond w25q128 (16 MiB) SPI NOR flash and an RTL8367RB switch wired to
+the CPU-port Ethernet MAC.  The switch is managed through the GPIO
+bit-banged SMI bus (MDC, MDIO and the hardware reset line are the same
+pins the vendor BSP uses for them) by the upstream rtl8365mb DSA driver,
+and its CPU port reaches the MAC over RGMII.
+
+The RGMII run needs the switch to sample the receive clock about 0.6 ns
+late: left at zero the link still trains but corrupts frames - the
+switch's own CPU-port dot3StatsFCSErrors grow in step with the frames
+the CPU sends - so port@6 sets rx-internal-delay-ps = <600>, two steps
+of the ~300 ps RX delay ladder that the vendor boot code and the vendor
+switch driver program for this interface.
+
+eth0 itself is the GMAC side of that link: a point-to-point 1000M
+full-duplex fixed link rather than a manageable PHY, with plain "rgmii"
+on both ends - the MAC window has no delay controls, and the switch side
+is where the RGMII sampling is configured (see the port@6 node).
+
+Enable UART, GPIO, watchdog, the SPI NOR flash with the partition table
+the stock firmware prints (the two unaligned Kernel/RootFS entries are
+merged into one firmware partition), USB, Ethernet with the lan1-lan4/wan
+switch ports, and PCIe, whose root port carries the RTL8822B WLAN combo.
+The switch node of the SoC dtsi is enabled here as well: the quirk
+driver that claims it travels with this tree as a local-only patch and
+brings the core up against the CPU port this file describes.
+
+The factory calibration record the WiFi core runs from is described
+here too: this board's eFuse reads blank, so without a DT source the
+interface comes up with a different address on every boot and every
+rate is driven from the bottom of the PA ladder.  The "config"
+partition's first wireless record starts at 0x13 - a 6-byte header, two
+Ethernet addresses, then per interface eight addresses, seven 14-entry
+per-channel power arrays and the board options - and is the one the
+stock driver runs wlan0 from; it is described as one nvmem cell the
+driver indexes, so the offsets the vendor uses are named once, in the
+driver.  The second record, at 0x668, belongs to the PCIe 5 GHz radio
+and is deliberately not described: its 2.4 GHz fields are blank and its
+196-entry arrays are the 5 GHz channel plan.
+
+The boot arguments name the RTL8197F earlycon that the 8250 port quirk
+adds; stdout-path stays on serial0 at 38400 8N.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/mips/boot/dts/realtek/Makefile              |    1 
+ arch/mips/boot/dts/realtek/rtl8197f-mg1200ac.dts |  286 ++++++++++++++++++++++
+ 2 files changed, 287 insertions(+)
+ create arch/mips/boot/dts/realtek/rtl8197f-mg1200ac.dts
+
+--- a/arch/mips/boot/dts/realtek/Makefile
++++ b/arch/mips/boot/dts/realtek/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
+ dtb-$(CONFIG_MACH_REALTEK_RTL)	+= cisco_sg220-26.dtb
+ dtb-$(CONFIG_MACH_REALTEK_RTL)	+= cameo-rtl9302c-2x-rtl8224-2xge.dtb
++dtb-$(CONFIG_MACH_REALTEK_RTL819X)	+= rtl8197f-mg1200ac.dtb
+--- /dev/null
++++ b/arch/mips/boot/dts/realtek/rtl8197f-mg1200ac.dts
+@@ -0,0 +1,286 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR BSD-2-Clause
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include "rtl8197f.dtsi"
++
++/ {
++	compatible = "netcore,mg1200ac", "realtek,rtl8197f-soc";
++	model = "Netcore MG1200AC";
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x8000000>;
++	};
++
++	chosen {
++		stdout-path = "serial0:38400n8";
++		bootargs = "earlycon=rtl8197f,mmio32,0x18147000 console=ttyS0,38400";
++	};
++
++	/*
++	 * External RTL8367RB switch, bit-banged over the SMI (GPIO MDC/MDIO)
++	 * lines the vendor BSP uses for the same purpose: MDC on PC2, MDIO on
++	 * PC3, hardware reset on PH2.  The CPU interface is extended port 2
++	 * (port 6), RGMII to the internal GMAC.  The four PHY ports map the
++	 * board LAN jacks; the WAN jack sits on port 0.
++	 */
++	switch {
++		compatible = "realtek,rtl8365mb";
++		mdc-gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
++		mdio-gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&gpio1 26 GPIO_ACTIVE_LOW>;
++		realtek,disable-leds;
++
++		mdio {
++			compatible = "realtek,smi-mdio";
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			internal_phy0: ethernet-phy@0 {
++				reg = <0>;
++			};
++
++			internal_phy1: ethernet-phy@1 {
++				reg = <1>;
++			};
++
++			internal_phy2: ethernet-phy@2 {
++				reg = <2>;
++			};
++
++			internal_phy3: ethernet-phy@3 {
++				reg = <3>;
++			};
++
++			internal_phy4: ethernet-phy@4 {
++				reg = <4>;
++			};
++		};
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				label = "wan";
++				phy-mode = "internal";
++				phy-handle = <&internal_phy0>;
++			};
++
++			port@1 {
++				reg = <1>;
++				label = "lan1";
++				phy-mode = "internal";
++				phy-handle = <&internal_phy1>;
++			};
++
++			port@2 {
++				reg = <2>;
++				label = "lan2";
++				phy-mode = "internal";
++				phy-handle = <&internal_phy2>;
++			};
++
++			port@3 {
++				reg = <3>;
++				label = "lan3";
++				phy-mode = "internal";
++				phy-handle = <&internal_phy3>;
++			};
++
++			port@4 {
++				reg = <4>;
++				label = "lan4";
++				phy-mode = "internal";
++				phy-handle = <&internal_phy4>;
++			};
++
++			port@6 {
++				reg = <6>;
++				ethernet = <&eth0>;
++				/*
++				 * The switch has to sample the RGMII receive clock
++				 * about 0.6 ns late.  Left at zero the link still
++				 * trains but corrupts frames: the switch's own
++				 * CPU-port dot3StatsFCSErrors grow in step with the
++				 * frames the CPU sends.  Two steps of the ~300 ps
++				 * RX delay ladder is what the vendor boot code and
++				 * the vendor switch driver program for this
++				 * interface.
++				 */
++				phy-mode = "rgmii";
++				rx-internal-delay-ps = <600>;
++
++				fixed-link {
++					speed = <1000>;
++					full-duplex;
++				};
++			};
++		};
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++&gpio0 {
++	status = "okay";
++};
++
++&gpio1 {
++	status = "okay";
++};
++
++&timer0 {
++	status = "okay";
++};
++
++&wdt {
++	timeout-sec = <30>;
++	status = "okay";
++};
++
++&usb_ohci {
++	status = "okay";
++};
++
++&usb_ehci {
++	status = "okay";
++};
++
++&eth0 {
++	status = "okay";
++
++	/*
++	 * The GMAC serves the external switch's CPU port (port 6) over
++	 * RGMII.  The receive-clock compensation is owned by the switch
++	 * side (see the port@6 node above), so the MAC side stays plain
++	 * "rgmii".  The link is a point-to-point run inside the PCB, so
++	 * it is described as a fixed link.
++	 */
++	phy-mode = "rgmii";
++
++	fixed-link {
++		speed = <1000>;
++		full-duplex;
++	};
++};
++
++&switch {
++	status = "okay";
++};
++
++&pcie {
++	status = "okay";
++};
++
++&spi0 {
++	status = "okay";
++
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <12500000>;
++
++		/*
++		 * Vendor layout, as printed by the stock firmware.  The two unaligned "Kernel" / "RootFS"
++		 * sub-partitions are merged into "firmware"; the trailing
++		 * "ALL" (full-flash) entry is dropped.
++		 */
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "boot";
++				reg = <0x0 0x20000>;
++				read-only;
++			};
++
++			partition@20000 {
++				label = "config";
++				reg = <0x20000 0x10000>;
++				read-only;
++
++				/* The factory MIB: ASCII "H601" at offset 0, a
++				 * big-endian length at 4, then the board
++				 * settings: the two Ethernet addresses at 0x7
++				 * and 0xd, then one record per wireless
++				 * interface starting at 0x13, each holding 8
++				 * addresses, the per-channel TX power levels
++				 * and the board options.  Same layout the
++				 * vendor userspace decodes: struct
++				 * hw_setting is boardVer, nic0Addr, nic1Addr
++				 * and then hw_wlan_setting records, read at
++				 * HW_SETTING_ETHMAC_OFFSET 1 and
++				 * HW_WLAN_SETTING_OFFSET 13, both relative to
++				 * that 6-byte header.
++				 *
++				 * The interface's own record is taken whole
++				 * and indexed by the driver, so only its
++				 * start and length are ABI here.  163 bytes
++				 * is the part this core reads: 48 bytes of
++				 * addresses, seven 14-entry per-channel power
++				 * arrays and the 17 board-option bytes
++				 * (regulatory domain, RFE type, crystal
++				 * trim, thermal tracking flag).  The record
++				 * at 0x668 belongs to the PCIe 5 GHz radio.
++				 */
++				compatible = "nvmem-cells";
++				#address-cells = <1>;
++				#size-cells = <1>;
++
++				efuse_config_13: efuse@13 {
++					reg = <0x13 0xa3>;
++				};
++			};
++
++			/* Winbond w25q128 (16 MiB). */
++			partition@30000 {
++				label = "firmware";
++				reg = <0x30000 0xad0000>;
++			};
++
++			partition@b00000 {
++				label = "plugin";
++				reg = <0xb00000 0x4d0000>;
++			};
++
++			partition@fd0000 {
++				label = "reserve";
++				reg = <0xfd0000 0x10000>;
++				read-only;
++			};
++
++			partition@fe0000 {
++				label = "parameter2";
++				reg = <0xfe0000 0x10000>;
++				read-only;
++			};
++
++			partition@ff0000 {
++				label = "parameter1";
++				reg = <0xff0000 0x10000>;
++				read-only;
++			};
++		};
++	};
++};
++
++&wifi {
++	status = "okay";
++
++	/* The board's factory record from the "config" MIB partition (this
++	 * SoC's on-die efuse reads blank): its first field is the address
++	 * wlan0 runs with, the rest are the per-channel TX power levels.
++	 * Without it the driver warns and falls back to a random locally
++	 * administered address, and every rate is driven from the vendor's
++	 * default level instead of this unit's calibrated one.
++	 */
++	nvmem-cells = <&efuse_config_13>;
++	nvmem-cell-names = "efuse";
++};

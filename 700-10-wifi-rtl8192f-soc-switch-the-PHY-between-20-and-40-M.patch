@@ -1,0 +1,482 @@
+From 3f68ab3ec6e9f59a42cf236ec25383584a6ca2b6 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 9 Oct 2026 03:40:18 +0800
+Subject: [PATCH 10/19] wifi: rtl8192f-soc: switch the PHY between 20 and 40 MHz
+
+The driver negotiated 20 MHz only: ht_cap lacked SUP_WIDTH_20_40, so
+cfg80211_chandef_usable() rejected any 40 MHz chandef and the whole
+bandwidth path stayed unwritten.  Port the vendor's switch, which is
+SwBWMode88XX_97F() plus the BB half of
+config_phydm_switch_bandwidth_8197f(), and follow it through the rest of
+the TX chain, because moving the analyser is not enough - the PHY takes
+the width per descriptor:
+
+ - REG_DATA_SC (0x483) names the secondary channel, the BB "RF mode"
+   pair 0x800[0]/0x900[0] selects the width, the DAC clock (0x800[14:12])
+   and ADC buffer clock (0xca4[27:26]) carry the same value on both
+   widths in the vendor's two branches, and the ADC clock (0xbb0[18:16])
+   is only programmed on the way back to 20 MHz because the 40 MHz
+   branch leaves it to the BB init table.  RF 0x18[11:10] is merged into
+   the channel write so the synthesizer and the width change together.
+ - TX descriptor W5 DATA_BW/DATA_SC say how wide each frame is (vendor
+   8192cd_tx.c 3435-3452 for HT rates, 3608-3620 for narrower ones), and
+   the resident beacon slot gets the same secondary-channel code
+   (FillBeaconDesc88XX_V1, Hal88XXTxDesc.c 3138-3145).  Note that this
+   encoding is the mirror image of the REG_DATA_SC one.
+ - The RA_MASK H2C carries the width in byte 2 and picks the short-GI
+   capability for that width in byte 7 (H2CCommand[1]/[2] in
+   Hal88XXFirmware.c 1552-1555, Get_RA_ShortGI88XX :1098-1111).
+ - The PA ladder changes with the width: at 40 MHz the HT group uses the
+   stored HT40 level directly and only the OFDM group takes its
+   per-channel difference (Hal88XXPhyCfg.c 4512-4516).
+ - ht_cap advertises SHORT-GI-40 as the shipped AP does (the mib default
+   dot11nShortGIfor40M is 1, 8192cd_net80211.c:245), and the RX width
+   now comes out of the type-1 PHY status rather than being assumed,
+   since the 8197F RX info descriptor has no bandwidth bit
+   (phydm_hwconfig.c 3270-3289).
+
+Channel-edge widths need no driver flags: cfg80211_chandef_valid()
+rejects any non-20_NOHT chandef on channel 14 and
+cfg80211_chandef_usable() requires every sub-channel of the chandef to
+be one this driver declared, which is also how rtw88 leaves its table.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../net/wireless/realtek/rtl8192f-soc/core.c  | 13 ++-
+ .../net/wireless/realtek/rtl8192f-soc/fw.c    | 19 ++--
+ .../net/wireless/realtek/rtl8192f-soc/hw.c    | 99 ++++++++++++++++---
+ .../net/wireless/realtek/rtl8192f-soc/rate.c  | 29 ++++--
+ .../realtek/rtl8192f-soc/rtl8192f_soc.h       | 19 +++-
+ .../net/wireless/realtek/rtl8192f-soc/txrx.c  | 53 ++++++++--
+ 6 files changed, 192 insertions(+), 40 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/core.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/core.c
+@@ -66,6 +66,8 @@ static struct ieee80211_supported_band r
+ 	.ht_cap		= {
+ 		.ht_supported = true,
+ 		.cap = IEEE80211_HT_CAP_SGI_20 |
++		       IEEE80211_HT_CAP_SGI_40 |
++		       IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+ 		       IEEE80211_HT_CAP_MAX_AMSDU |
+ 		       (1 << IEEE80211_HT_CAP_RX_STBC_SHIFT),
+ 		.ampdu_factor = IEEE80211_HT_MAX_AMPDU_16K,
+@@ -88,12 +90,8 @@ static int rtl8192f_config(struct ieee80
+ 		struct ieee80211_channel *ch = hw->conf.chandef.chan;
+ 
+ 		if (priv->running)
+-			ret = rtl8192f_set_channel(priv, ch->hw_value);
+-		if (!ret) {
+-			priv->cur_channel = ch->hw_value;
+-			priv->cur_chan_type =
+-				cfg80211_get_chandef_type(&hw->conf.chandef);
+-		}
++			ret = rtl8192f_set_channel(priv, ch->hw_value,
++						   cfg80211_get_chandef_type(&hw->conf.chandef));
+ 	}
+ 
+ 	mutex_unlock(&priv->conf_mutex);
+@@ -144,7 +142,8 @@ static int rtl8192f_start(struct ieee802
+ 	priv->running = true;
+ 
+ 	if (priv->cur_channel)
+-		rtl8192f_set_channel(priv, priv->cur_channel);
++		rtl8192f_set_channel(priv, priv->cur_channel,
++				     priv->cur_chan_type);
+ 
+ 	ieee80211_wake_queues(hw);
+ 
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/fw.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/fw.c
+@@ -621,6 +621,8 @@ int rtl8192f_fw_alive(struct rtl8192f_so
+ void rtl8192f_send_ra_mask(struct rtl8192f_soc_priv *priv, u8 macid,
+ 			   const struct ieee80211_sta *sta)
+ {
++	bool wide = sta->deflink.bandwidth >= IEEE80211_STA_RX_BW_40;
++	u16 sgi_cap = wide ? IEEE80211_HT_CAP_SGI_40 : IEEE80211_HT_CAP_SGI_20;
+ 	u8 cmd[7];
+ 	u32 ratr;
+ 	int ret;
+@@ -651,15 +653,20 @@ void rtl8192f_send_ra_mask(struct rtl819
+ 	 * selector - phydm_rate_id_mapping() picks it from mode/streams/
+ 	 * bandwidth - so it must be the same value the TX descriptor's
+ 	 * RATE_ID field carries, or the scheduler looks up a ladder that
+-	 * does not describe this peer's band width.
++	 * does not describe this peer's band width.  The GI bit is the one
++	 * belonging to that width, not always the 20 MHz one
++	 * (Get_RA_ShortGI88XX, :1098-1111).
+ 	 */
+ 	cmd[1] = rtl8192f_ra_rate_id(sta) |
+-		 ((sta->deflink.ht_cap.cap &
+-		   cpu_to_le16(IEEE80211_HT_CAP_SGI_20)) ? BIT(7) : 0);
+-	/* Bandwidth 0 (this driver never advertises HT40) plus
+-	 * DisableTXPowerTraining, as the vendor sets them (:1542-1547).
++		 ((sta->deflink.ht_cap.cap & cpu_to_le16(sgi_cap)) ?
++		  BIT(7) : 0);
++	/* Band width in bits[1:0], with the vendor's own codes (0 = 20 MHz,
++	 * 1 = 40 MHz) and DisableTXPowerTraining, as the vendor sets them
++	 * (:1553-1555).  sta->deflink.bandwidth is the peer's width already
++	 * capped by this BSS's chandef, which is the pair of tests the
++	 * vendor applies (is_40m_bw && pstat->tx_bw, :1278-1289).
+ 	 */
+-	cmd[2] = BIT(6);
++	cmd[2] = (wide ? 1 : 0) | BIT(6);
+ 	put_unaligned_le32(ratr, &cmd[3]);
+ 
+ 	ret = rtl8192f_h2c_send(priv, H2C_88XX_RA_MASK, cmd, sizeof(cmd));
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/hw.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/hw.c
+@@ -492,7 +492,8 @@ static u8 rtl8192f_calib_get(const struc
+ 	return priv->has_calib ? priv->calib[off] : 0;
+ }
+ 
+-static void rtl8192f_set_tx_power(struct rtl8192f_soc_priv *priv, u32 channel)
++static void rtl8192f_set_tx_power(struct rtl8192f_soc_priv *priv, u32 channel,
++				  bool wide)
+ {
+ 	unsigned int idx = channel - 1;
+ 	const s8 *ofdm_ramp = rtl8192f_pg_ofdm;
+@@ -500,12 +501,11 @@ static void rtl8192f_set_tx_power(struct
+ 	u8 level, ofdm, ht, ht2s, cck_a, cck_b;
+ 
+ 	/* OFDM and HT share one stored level: the HT40 column of the record.
+-	 * The OFDM and HT20 groups are that level shifted by their own
+-	 * per-channel diff nibble, and MCS8-15 shift the HT20 result once
+-	 * more (Hal88XXPhyCfg.c 4490, 4521, 4540).  This core has a single
+-	 * transmitter, so only path A is programmed - MCS8-15 still mirror
+-	 * the single-stream groups, as they do on the shipped AP (measured:
+-	 * 0xe18 == 0xe10 and 0xe1c == 0xe14).
++	 * The OFDM group and, at 20 MHz only, the HT group are that level
++	 * shifted by their own per-channel diff nibble, and MCS8-15 shift the
++	 * HT result once more (Hal88XXPhyCfg.c 4490, 4516, 4521, 4540).  This
++	 * core has a single transmitter, so only path A is programmed -
++	 * MCS8-15 still mirror the single-stream groups.
+ 	 */
+ 	level = rtl8192f_calib_get(priv, RTL8192F_CAL_PWR_HT40_A + idx);
+ 	if (!level)
+@@ -514,10 +514,12 @@ static void rtl8192f_set_tx_power(struct
+ 				   rtl8192f_calib_get(priv,
+ 						      RTL8192F_CAL_DIFF_OFDM + idx),
+ 				   false);
+-	ht = rtl8192f_txpwr_diff(level,
+-				 rtl8192f_calib_get(priv,
+-						    RTL8192F_CAL_DIFF_HT20 + idx),
+-				 false);
++	ht = level;
++	if (!wide)
++		ht = rtl8192f_txpwr_diff(ht,
++					 rtl8192f_calib_get(priv,
++							    RTL8192F_CAL_DIFF_HT20 + idx),
++					 false);
+ 	ht2s = rtl8192f_txpwr_diff(ht,
+ 				   rtl8192f_calib_get(priv,
+ 						      RTL8192F_CAL_DIFF_HT40_2S + idx),
+@@ -865,7 +867,7 @@ int rtl8192f_hw_init(struct rtl8192f_soc
+ 	 * table's zero would drive every frame from the bottom of the PA
+ 	 * ladder in the window before the first config().
+ 	 */
+-	rtl8192f_set_tx_power(priv, priv->cur_channel ?: 1);
++	rtl8192f_set_tx_power(priv, priv->cur_channel ?: 1, false);
+ 
+ 	priv->hw_ready = true;
+ 
+@@ -879,24 +881,92 @@ int rtl8192f_hw_init(struct rtl8192f_soc
+ /* Channel switching                                                   */
+ /* ------------------------------------------------------------------ */
+ 
++/* Secondary channel index for REG_DATA_SC, per get_txsc_92e()
++ * (8192cd_hw.c 18487-18499): 1 when the extension channel sits below the
++ * primary, 2 above, 0 at 20 MHz.
++ */
++#define RTL8192F_DATA_SC_BELOW		1
++#define RTL8192F_DATA_SC_ABOVE		2
++
++/* Program the 20/40 MHz path.  This is SwBWMode88XX_97F()
++ * (Hal8197FPhyCfg.c 78-102) plus the BB half of
++ * config_phydm_switch_bandwidth_8197f() (phydm_hal_api8197f.c 889-961);
++ * the RF half (0x18[11:10]) is folded into the channel write below so the
++ * synthesizer and the width change in one HSSI transaction.
++ *
++ * The DAC clock field (0x800[14:12] = 5) and the ADC buffer clock
++ * (0xca4[27:26] = 2) carry the same value on both widths in the vendor's
++ * 20 MHz and 40 MHz branches, so writing them unconditionally is not a
++ * change of behaviour; the ADC clock (0xbb0[18:16]) is only touched on the
++ * way back to 20 MHz because the vendor's 40 MHz branch leaves it to the BB
++ * init table.
++ */
++static void rtl8192f_set_bandwidth(struct rtl8192f_soc_priv *priv,
++				   enum nl80211_channel_type chan_type)
++{
++	bool wide = chan_type == NL80211_CHAN_HT40PLUS ||
++		    chan_type == NL80211_CHAN_HT40MINUS;
++	u8 sc = 0;
++
++	if (wide)
++		sc = chan_type == NL80211_CHAN_HT40MINUS ?
++			RTL8192F_DATA_SC_BELOW : RTL8192F_DATA_SC_ABOVE;
++
++	rtl8192f_write8(priv, REG_DATA_SC,
++			(rtl8192f_read8(priv, REG_DATA_SC) & 0xf0) | sc);
++
++	rtl8192f_rmw_bb(priv, REG_SMALL_BANDWIDTH, 0xc0000000, 0);
++	rtl8192f_rmw_bb(priv, REG_RF_MODE, BIT(0), wide ? BIT(0) : 0);
++	rtl8192f_rmw_bb(priv, REG_RF_MODE_PAGE9, BIT(0), wide ? BIT(0) : 0);
++	rtl8192f_rmw_bb(priv, REG_RF_MODE, 0x7000, 5 << 12);
++	rtl8192f_rmw_bb(priv, REG_ANTDIV_PARA1, 0xc000000, 2 << 26);
++
++	if (wide) {
++		/* CCK lives in the lower 20 MHz half when the extension
++		 * channel is above the primary (the vendor's
++		 * primary_ch_idx == 1 test).
++		 */
++		rtl8192f_rmw_bb(priv, REG_CCK_ANTDIV_PARA1, BIT(4),
++				chan_type == NL80211_CHAN_HT40MINUS ? BIT(4) : 0);
++	} else {
++		rtl8192f_rmw_bb(priv, REG_RXCK_RFMOD, 0x70000, 4 << 16);
++	}
++
++	/* A width change moves the analyser's passband, so the vendor runs
++	 * the same LCK/IQK as a channel switch does; the caller does it right
++	 * after this.
++	 */
++}
++
+ /* vendor phydm_hal_api8197f.c config_phydm_switch_channel_8197f():
+  * RF reg 0x18 carries both band select (bits 17:18, cleared for 2.4G)
+  * and the central channel number in bits 7:0; the synthesizer is fed
+  * the channel number directly, there is no N-divider LUT for 2.4G.
+  */
+-int rtl8192f_set_channel(struct rtl8192f_soc_priv *priv, u32 channel)
++int rtl8192f_set_channel(struct rtl8192f_soc_priv *priv, u32 channel,
++			 enum nl80211_channel_type chan_type)
+ {
++	bool wide = chan_type == NL80211_CHAN_HT40PLUS ||
++		    chan_type == NL80211_CHAN_HT40MINUS;
+ 	u32 rf18;
+ 
+ 	if (!channel || channel > 14)
+ 		return -EINVAL;
+ 
++	rtl8192f_set_bandwidth(priv, chan_type);
++
+ 	rf18 = rtl8192f_phy_get_rf_reg(priv, RF_REG_MODE_AG);
+ 
+ 	/* switch to 2.4G band and program central channel */
+ 	rf18 &= ~(RF_MODE_AG_BAND_MASK | 0xff);
+ 	rf18 |= channel;
+ 
++	/* RF bandwidth, 0x18[11:10]: both bits set for 20 MHz, only bit11
++	 * for 40 MHz (phydm_hal_api8197f.c 933, 958-960).
++	 */
++	rf18 &= ~(BIT(11) | BIT(10));
++	rf18 |= wide ? BIT(11) : (BIT(11) | BIT(10));
++
+ 	rtl8192f_phy_set_rf_reg(priv, RF_REG_MODE_AG, rf18);
+ 
+ 	/* The vendor recalibrates and re-programs the PA ladder on every
+@@ -908,9 +978,10 @@ int rtl8192f_set_channel(struct rtl8192f
+ 	 * correction in place.
+ 	 */
+ 	rtl8192f_iqk(priv);
+-	rtl8192f_set_tx_power(priv, channel);
++	rtl8192f_set_tx_power(priv, channel, wide);
+ 
+ 	priv->cur_channel = channel;
++	priv->cur_chan_type = chan_type;
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/rate.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rate.c
+@@ -162,6 +162,24 @@ static const s8 rtl8192f_cck_rssi_base[8
+ 	2, -2, -12, -18, -26, -32, -42, -52
+ };
+ 
++/* Width an HT frame was received at.  The RX info descriptor has no
++ * bandwidth bit, but the type-1 PHY status names the half the frame arrived
++ * on (byte 5's ht_rxsc nibble) next to the analyser's own rf_mode (byte 15
++ * [5:4]): 20 MHz while the analyser is narrow or the frame sits in a single
++ * half, 40 MHz when it spans both.  Legacy OFDM has no 40 MHz form, so only
++ * HT frames need this.  Vendor phydm_hwconfig.c 3270-3289 with
++ * PHY_STATUS_RPT_JAGUAR2_TYPE1.
++ */
++static enum rate_info_bw rtl8192f_rx_bw(const u8 *p)
++{
++	u8 ht_rxsc = p[5] >> 4;
++
++	if (((p[15] >> 4) & 0x3) == 0 || ht_rxsc == 1 || ht_rxsc == 2)
++		return RATE_INFO_BW_20;
++
++	return RATE_INFO_BW_40;
++}
++
+ void rtl8192f_rx_fill_status(struct rtl8192f_soc_priv *priv, __le32 *desc,
+ 			     void *phy_status,
+ 			     struct ieee80211_rx_status *status)
+@@ -190,7 +208,7 @@ void rtl8192f_rx_fill_status(struct rtl8
+ 
+ 		status->encoding = RX_ENC_HT;
+ 		status->rate_idx = mcs;
+-		status->bw = RATE_INFO_BW_20;
++		status->bw = rtl8192f_rx_bw(p);
+ 		/* Was falling through into the legacy tail, which
+ 		 * relabelled every HT frame LEGACY with
+ 		 * rate_idx = rate - 0x04 (up to 123) - one mac80211
+@@ -216,11 +234,10 @@ void rtl8192f_rx_fill_status(struct rtl8
+ 		return;
+ 	}
+ 
+-	/* OFDM/HT: JAGUAR2 type 1 report, per-path pwdb at bytes 1-4;
++	/* Legacy OFDM: JAGUAR2 type 1 report, per-path pwdb at bytes 1-4;
+ 	 * single receive path (path A), vendor phydm_GetRxPhyStatusType1
+-	 * (rx_path_pwr_db = pwdb - 110).  20 MHz / no-SGI assumed; the
+-	 * report's l_rxsc/ht_rxsc nibbles (byte 5) would carry the real
+-	 * bandwidth if a wider-channel peer ever shows up.
++	 * (rx_path_pwr_db = pwdb - 110).  No short-GI report exists for this
++	 * core, so the 20 MHz rate stays the reported rate.
+ 	 */
+ 	status->encoding = RX_ENC_LEGACY;
+ 	/* hw_value == array index in the band table (core.c), and the
+@@ -229,7 +246,7 @@ void rtl8192f_rx_fill_status(struct rtl8
+ 	 * the untrusted 7-bit field anyway.
+ 	 */
+ 	status->rate_idx = min_t(u8, rate, 11);
+-	status->bw = RATE_INFO_BW_20;
++	status->bw = RATE_INFO_BW_20;	/* OFDM has no 40 MHz form */
+ 
+ 	status->signal = (s8)p[1] - 110;
+ }
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+@@ -268,6 +268,11 @@
+ #define REG_HI0Q_TXBD_IDX		0x03B8
+ #define REG_RRSR			0x0440	/* Response Rate Set */
+ #define REG_ARFR1			0x044C	/* rate fall-back set 1, 64 bit */
++/* Channel width: the secondary-channel index, and the BB/RF bits that
++ * select 20 vs 40 MHz.  Names follow the vendor's phydm register table
++ * (phydm_regdefine11n.h) so a reader can match the write sequences.
++ */
++#define REG_DATA_SC			0x0483	/* [3:0] secondary channel */
+ #define REG_HWSEQ_CTRL			0x0423
+ #define REG_EDCA_VO_PARAM		0x0500
+ #define REG_EDCA_VI_PARAM		0x0504
+@@ -348,6 +353,17 @@
+ #define REG_RXFLTMAP1			0x06A2	/* control */
+ #define REG_RXFLTMAP2			0x06A4	/* data */
+ #define BIT_RXFLT_PSPOLL		BIT(10)
++/* BB side of the 20/40 MHz choice (phydm_regdefine11n.h 43/78/87/112/136):
++ * 0x800 bit0 and 0x900 bit0 are the "RF mode" pair, 0x800[14:12] the DAC
++ * clock, 0xca4[27:26] the ADC buffer clock, 0xa00 bit4 the CCK primary
++ * channel, and 0xce4[31:30] the small-bandwidth selector (0 = 20/40 MHz).
++ */
++#define REG_RF_MODE			0x0800
++#define REG_RF_MODE_PAGE9		0x0900
++#define REG_CCK_ANTDIV_PARA1		0x0A00
++#define REG_RXCK_RFMOD			0x0BB0
++#define REG_ANTDIV_PARA1			0x0CA4
++#define REG_SMALL_BANDWIDTH		0x0CE4
+ /* Byte registers at 0x60C-0x60F (HalComReg.h 1135-1137, halmac_reg2.h
+  * 1809-1811): RX_PKT_LIMIT 0x60C, RX_DLK_TIME 0x60D, and RX_DRVINFO_SZ
+  * 0x60F.  A wider write here spills into the neighbours - the previous
+@@ -1020,7 +1036,8 @@ void rtl8192f_send_ra_mask(struct rtl819
+ 			   const struct ieee80211_sta *sta);
+ u8 rtl8192f_ra_rate_id(const struct ieee80211_sta *sta);
+ void rtl8192f_hw_power_off(struct rtl8192f_soc_priv *priv);
+-int rtl8192f_set_channel(struct rtl8192f_soc_priv *priv, u32 channel);
++int rtl8192f_set_channel(struct rtl8192f_soc_priv *priv, u32 channel,
++			 enum nl80211_channel_type chan_type);
+ int rtl8192f_read_calib(struct rtl8192f_soc_priv *priv);
+ int rtl8192f_efuse_read(struct rtl8192f_soc_priv *priv);
+ int rtl8192f_efuse_get_macaddr(struct rtl8192f_soc_priv *priv);
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
+@@ -145,8 +145,22 @@ static u16 queue_to_ac(u8 qidx)
+ #define TXD_W4_DATA_RT_LMT		GENMASK(23, 18)
+ #define TXD_W9_SW_SEQ			GENMASK(23, 12)
+ #define TXD_W4_RTSRATE			GENMASK(28, 24)
++#define TXD_W5_DATA_SC			GENMASK(3, 0)	/* vendor TX_DW5_DATA_SC_SH 0 */
+ #define TXD_W5_DATA_SHORT		BIT(4)
+ #define TXD_W5_DATA_BW			GENMASK(6, 5)
++#define TXD_W5_RTS_SC			GENMASK(16, 13)	/* vendor TX_DW5_RTS_SC_SH 13 */
++
++/* W5 DATA_SC codes name the half the frame does *not* use as its center:
++ * 1 with the extension channel above the primary, 2 below it, 3 when the
++ * frame occupies both halves (vendor HalComTXDesc.h 533-534
++ * TXDESC_DATASC_UPPER/LOWER, applied at 8192cd_tx.c 3435-3452 and
++ * 3608-3620).  The encoding is the mirror image of the REG_DATA_SC value
++ * hw.c programs, where below is 1.
++ */
++#define TXD_DATA_SC_ABOVE		1
++#define TXD_DATA_SC_BELOW		2
++#define TXD_DATA_SC_BOTH		3
++#define TXD_DATA_BW_40			1	/* vendor HT_CHANNEL_WIDTH_20_40 */
+ 
+ /* RX info descriptor (24B) DW0/DW3 bit fields, 88XX/8197F layout
+  * (halmac_rx_desc_nic.h 20-40/80: CRC32 DW0 bit14, ICVERR DW0 bit15).
+@@ -157,9 +171,9 @@ static u16 queue_to_ac(u8 qidx)
+ #define RXD_W0_DRV_INFO_SIZE		GENMASK(19, 16)	/* in 8B units */
+ #define RXD_W0_SHIFT			GENMASK(25, 24)
+ /* DW3: RX_RATE is 7 bits (0-11 legacy linear, 12+ = MCS0+); there are
+- * NO SGI/BW fields in the 8197F RX info descriptor - the old W3
+- * bits 8/9 reads hit BSSID_FIT/HTC garbage .  SGI/BW
+- * reporting needs the PHY status (TODO).
++ * no SGI/BW fields in the 8197F RX info descriptor - the old W3
++ * bits 8/9 reads hit BSSID_FIT/HTC garbage.  Bandwidth comes from the
++ * PHY status instead (rate.c); short GI has no report field at all.
+  */
+ /* DW2 bit28 marks a firmware-to-host C2H message (HalComRXDesc.h
+  * 162/173, mask 0x1 shift 28); the vendor rx path branches on it in
+@@ -896,9 +910,7 @@ static void rtl8192f_fill_tx_desc(struct
+ 
+ 	/* W5 DATA_SHORT is one bit serving two meanings: short preamble
+ 	 * on CCK rates, short GI on HT rates (vendor TX_DW5_DATA_SHORT,
+-	 * rtw88 RTW_TX_DESC_W5_DATA_SHORT).  20MHz only: no 40MHz
+-	 * operation is configured yet.  TODO: set W5 DATA_BW and W3
+-	 * NAVUSEHDR once 40MHz RX/TX is brought up.
++	 * rtw88 RTW_TX_DESC_W5_DATA_SHORT).
+ 	 */
+ 	if (!is_mgmt && rate < 4 &&
+ 	    (tx_info->control.rates[0].flags &
+@@ -908,6 +920,27 @@ static void rtl8192f_fill_tx_desc(struct
+ 		 (tx_info->control.rates[0].flags & IEEE80211_TX_RC_SHORT_GI))
+ 		w5 |= TXD_W5_DATA_SHORT;
+ 
++	/* DATA_BW/DATA_SC say how wide this frame is.  The analyser moved
++	 * there or to 20 MHz in rtl8192f_set_bandwidth(), but the PHY takes
++	 * the width per descriptor, so a frame that does not name it is
++	 * transmitted 20 MHz wide no matter what the synthesizer is doing.
++	 * A 40 MHz frame uses both halves; a narrower frame inside a 40 MHz
++	 * BSS has to name which half is its primary, and so does the RTS in
++	 * front of it (vendor 8192cd_tx.c 3435-3437 for the 40 MHz case,
++	 * 3443-3452 and 3608-3620 for the narrower ones).  Rate control only
++	 * offers 40 MHz groups once the peer negotiated that width, so a
++	 * 20 MHz client on a 40 MHz BSS lands in the second arm.
++	 */
++	if (tx_info->control.rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++		w5 |= le32_encode_bits(TXD_DATA_BW_40, TXD_W5_DATA_BW) |
++		      le32_encode_bits(TXD_DATA_SC_BOTH, TXD_W5_DATA_SC);
++	else if (priv->cur_chan_type == NL80211_CHAN_HT40MINUS)
++		w5 |= le32_encode_bits(TXD_DATA_SC_BELOW, TXD_W5_DATA_SC) |
++		      le32_encode_bits(TXD_DATA_SC_BELOW, TXD_W5_RTS_SC);
++	else if (priv->cur_chan_type == NL80211_CHAN_HT40PLUS)
++		w5 |= le32_encode_bits(TXD_DATA_SC_ABOVE, TXD_W5_DATA_SC) |
++		      le32_encode_bits(TXD_DATA_SC_ABOVE, TXD_W5_RTS_SC);
++
+ 	/* W2 AGG_EN is the switch that makes the core collect consecutive
+ 	 * descriptors of this macid/queue into one A-MPDU instead of
+ 	 * handing each one its own ACK.  mac80211 sets TX_CTL_AMPDU only
+@@ -2145,6 +2178,14 @@ void rtl8192f_beacon_upload(struct rtl81
+ 	desc[4] = cpu_to_le32(le32_encode_bits(RTL8192F_BCN_HW_RATE,
+ 					       TXD_W4_DATARATE) |
+ 		le32_encode_bits(0x1f, TXD_W4_DATARATE_FB_LIMIT));
++	/* W5: the beacon is a 20 MHz frame, but in a 40 MHz BSS it still has
++	 * to name its primary half (vendor FillBeaconDesc88XX_V1,
++	 * Hal88XXTxDesc.c 3138-3145).
++	 */
++	if (priv->cur_chan_type == NL80211_CHAN_HT40MINUS)
++		desc[5] = cpu_to_le32(le32_encode_bits(TXD_DATA_SC_BELOW, TXD_W5_DATA_SC));
++	else if (priv->cur_chan_type == NL80211_CHAN_HT40PLUS)
++		desc[5] = cpu_to_le32(le32_encode_bits(TXD_DATA_SC_ABOVE, TXD_W5_DATA_SC));
+ 	/* W7 TXBUFF (see rtl8192f_fill_tx_desc; vendor uses len-24) */
+ 	desc[7] = cpu_to_le32(len - 24);
+ 	/* W9 SW_SEQ from the template's own header, as the vendor beacon

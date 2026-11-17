@@ -1,0 +1,121 @@
+From 9b108cda205c0584398929863812f1b4dc3a6312 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Mon, 21 Sep 2026 04:08:09 +0800
+Subject: [PATCH 1/2] dt-bindings: clock: add Realtek RTL8197F clock controller
+
+The RTL8197F derives its CPU, LX bus, UART and SPI clocks from a 25
+MHz crystal through a strap-selectable PLL and fixed dividers.  Add
+the binding for the clock controller with consumers for all seven
+output cells: cpu, lx, uart, spi, the WLAN clock/function gate, the
+crystal reference the integrated WiFi core is fed and the switch-core
+gate.
+
+The controller is not a device of its own: the strap register, the bus
+and function gates and the pin muxing all live in one block at
+0x18000000 that is already described as a syscon.  Describe the clock
+provider as a child of that node, with a reg of 0x68 bytes (the strap
+register at 0x08, the WLAN gate at 0x64); the system controller
+binding describes the parent side.  The binding has no "clocks"
+property: the controller takes its reference straight from the strap
+and there is no provider for it to name.  The WLAN gate is not
+cosmetic: while it is closed, the WiFi core's MMIO window does not
+answer reads at all, so the gate gets its own cell for the WiFi driver
+to switch on, and the crystal-select strap bit is published as a
+reference clock because the core's analog front end has to be told the
+same 25/40 MHz choice.  The switch-core gate exists so the switch
+driver can pulse the clock during its core reset.  The cell indices
+the consumers use are named in the dt-bindings header added here.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ include/dt-bindings/clock/realtek-rtl819x-clks.h   |   24 +++++++++
+ .../bindings/clock/realtek,rtl8197f-clock.yaml     |   55 ++++++++++++++++++++
+ 2 files changed, 79 insertions(+)
+ create include/dt-bindings/clock/realtek-rtl819x-clks.h
+ create Documentation/devicetree/bindings/clock/realtek,rtl8197f-clock.yaml
+
+--- /dev/null
++++ b/include/dt-bindings/clock/realtek-rtl819x-clks.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause */
++/*
++ * Device Tree clock indices for the Realtek RTL819x SoC family.
++ *
++ * Copyright (c) 2026 David Yang <mmyangfl@gmail.com>
++ */
++
++#ifndef _DT_BINDINGS_CLOCK_REALTEK_RTL819X_CLKS_H_
++#define _DT_BINDINGS_CLOCK_REALTEK_RTL819X_CLKS_H_
++
++#define RTL8197F_CLK_CPU	0
++#define RTL8197F_CLK_LX		1
++#define RTL8197F_CLK_UART	2
++#define RTL8197F_CLK_SPI	3
++/* WLAN core clock/function gate in the system controller */
++#define RTL8197F_CLK_WLAN	4
++/* Crystal reference fed to the WLAN core (25 or 40 MHz by strap) */
++#define RTL8197F_CLK_WIFI_REF	5
++/* Embedded switch core clock gate in the system controller */
++#define RTL8197F_CLK_SWCORE	6
++
++#define RTL8197F_CLK_NR_CLKS	7
++
++#endif /* _DT_BINDINGS_CLOCK_REALTEK_RTL819X_CLKS_H_ */
+--- /dev/null
++++ b/Documentation/devicetree/bindings/clock/realtek,rtl8197f-clock.yaml
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/clock/realtek,rtl8197f-clock.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Realtek RTL8197F SoC clock controller
++
++maintainers:
++  - David Yang <mmyangfl@gmail.com>
++
++description: |
++  This node is a child of the system controller (see
++  Documentation/devicetree/bindings/soc/realtek/realtek,rtl8197f-syscon.yaml),
++  so its reg is relative to the system controller window.
++
++  The RTL8197F system controller holds the hardware strap register that
++  multiplexes and divides the CPU clock, the crystal-select strap bit,
++  and the WLAN clock/function gate.  The straps are read-only; the
++  WLAN gate is programmable, because the integrated WiFi core cannot be
++  accessed at all while it is closed.
++
++properties:
++  compatible:
++    const: realtek,rtl8197f-clock
++
++  reg:
++    maxItems: 1
++
++  '#clock-cells':
++    const: 1
++
++required:
++  - compatible
++  - reg
++  - '#clock-cells'
++
++additionalProperties: false
++
++examples:
++  - |
++    syscon@18000000 {
++        compatible = "realtek,rtl8197f-syscon", "syscon", "simple-mfd";
++        reg = <0x18000000 0x200>;
++        #address-cells = <1>;
++        #size-cells = <1>;
++        ranges = <0x0 0x18000000 0x200>;
++
++        clock-controller@0 {
++            compatible = "realtek,rtl8197f-clock";
++            /* strap at 0x08, WLAN clock/function gate at 0x64 */
++            reg = <0x0 0x68>;
++            #clock-cells = <1>;
++        };
++    };

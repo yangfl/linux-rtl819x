@@ -1,0 +1,174 @@
+From a14586d40544f1301dcff57f44190f5f4b952d98 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 9 Oct 2026 03:40:20 +0800
+Subject: [PATCH 15/19] wifi: rtl8192f-soc: put the TIM bitmap in the hardware beacon
+
+mac80211 computes a dozing station's TIM bit and hands it to the driver
+through set_tim, but this driver had no set_tim, so the resident beacon
+kept whatever bitmap the last template renewal carried - always "nothing
+buffered".  A station in power save was therefore never told to wake, and
+nothing reached it while it dozed.  Setting IEEE80211_HW_AP_LINK_PS
+instead does not deliver the buffered traffic either, so the
+advertisement is done in software.
+
+Write the TIM bytes into the buffer the core re-reads at every TBTT
+rather than renewing the slot.  The previous attempt here did renew it -
+ieee80211_beacon_get_tim() plus rtl8192f_beacon_upload() on each flip -
+and gating BCN_OWN while the hardware was fetching lost beacons and
+starved the peer.  The new helper touches no
+descriptor, no PSLEN and no ownership bit, only a same-length byte range;
+if the template length moved or the range does not fit, the update is
+refused and left to the next renewal.
+
+Answering PS-Poll is still not done, and the reason is recorded in the
+code: the vendor does it in the in-core scheduler, and the 8197F RX
+descriptor gives this driver no event to hang it on, so a client that
+only polls is not served.  What works is the station waking on its TIM
+bit and staying for the traffic, which is what these measurements
+exercise.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../net/wireless/realtek/rtl8192f-soc/core.c  | 68 +++++++++++++++----
+ .../realtek/rtl8192f-soc/rtl8192f_soc.h       |  3 +
+ .../net/wireless/realtek/rtl8192f-soc/txrx.c  | 30 ++++++++
+ 3 files changed, 86 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/core.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/core.c
+@@ -682,24 +682,61 @@ void rtl8192f_bss_info_changed(struct ie
+ 	mutex_unlock(&priv->conf_mutex);
+ }
+ 
++/* Advertise the buffered traffic for a dozing station.
++ *
++ * mac80211 computes the TIM bitmap into the beacon it hands over and
++ * points at it with the two offsets, so all the driver has to do is put
++ * those bytes where the hardware is already reading them.  Only the TIM
++ * bytes are written: re-uploading the whole slot on every flip gates
++ * BCN_OWN away from the core while it fetches (measured: repeated
++ * "beacon TX error" interrupts and heavy loss for the peer), while
++ * touching no descriptor and no ownership bit keeps the beacon the
++ * hardware sends whole.
++ */
++static int rtl8192f_set_tim(struct ieee80211_hw *hw,
++			    struct ieee80211_sta *pubsta, bool set)
++{
++	struct rtl8192f_soc_priv *priv = hw->priv;
++	struct ieee80211_vif *vif = priv->bss_vif;
++	u16 tim_off = 0, tim_len = 0;
++	struct sk_buff *skb;
++
++	if (!vif || vif->type != NL80211_IFTYPE_AP)
++		return 0;
++
++	skb = ieee80211_beacon_get_tim(hw, vif, &tim_off, &tim_len, 0);
++	if (!skb)
++		return 0;
++
++	if (!rtl8192f_beacon_tim_update(priv, skb, tim_off, tim_len))
++		dev_dbg_ratelimited(&priv->pdev->dev,
++				    "TIM change deferred (len %d tim %u+%u armed %u)\n",
++				    skb->len, tim_off, tim_len,
++				    priv->bcn.frame_len);
++
++	dev_kfree_skb_any(skb);
++	return 0;
++}
++
+ /*
+- * AP link power save is not implemented here and there is no .set_tim.
++ * What is still not done for AP link power save: answering PS-Poll.
+  *
+- * mac80211 only computes a station's TIM bit for the driver through
+- * set_tim, and that bit flips whenever the station has frames queued -
+- * including for an awake station, because the buffered-TID set it uses
+- * covers the driver's TX queues.  Re-uploading the resident beacon slot
+- * on each such flip gates BCN_OWN away from the hardware while it is
+- * fetching a beacon: measured on this board with 4 MB pushed over the
+- * association, that produced 25 "beacon TX error" interrupts in a few
+- * tens of seconds and dropped the peer's RX to the basic rate with 75 %
+- * packet loss, where without set_tim the same run reported none.
++ * The in-core scheduler owns that (the vendor's CPWM2 interrupt plus the
++ * u-APSD and PS-POLL handling in its own image, 8192cd_osdep.c
++ * 1901-1946 and 8192cd_rx.c 9035), and the 8197F RX info descriptor
++ * this driver decodes carries no "this was a PS-Poll" indication to
++ * report with ieee80211_sta_pspoll(), so there is no host-side event to
++ * hang it on.  A dozing station that only polls is therefore not
++ * served; what works is the station waking on its TIM bit and staying
++ * for the traffic, which is what pulls mac80211's buffered frames out.
+  *
+- * Doing it right means answering PS-POLL (or u-APSD) as well, which
+- * mac80211 offers no host-side path for - the vendor does both from the
+- * in-core scheduler, and that firmware is not part of this driver.  So
+- * the TIM stays as mac80211 last built it into the template, and a dozing
+- * client is served when it next transmits.
++ * The TIM bit has to be in the beacon the hardware actually sends, and
++ * mac80211 only computes it through set_tim - which it calls whenever
++ * the station has frames queued, including for an awake station,
++ * because the buffered-TID set it uses covers the driver's TX queues.
++ * So the advertisement has to reach the resident beacon slot without
++ * disturbing it: rtl8192f_beacon_tim_update() writes the TIM bytes in
++ * place, touching no descriptor and no ownership bit.
+  */
+ 
+ static void rtl8192f_op_tx(struct ieee80211_hw *hw,
+@@ -768,6 +805,7 @@ static const struct ieee80211_ops rtl819
+ 	.sta_state		= rtl8192f_sta_state,
+ 	.conf_tx		= rtl8192f_conf_tx,
+ 	.ampdu_action		= rtl8192f_ampdu_action,
++	.set_tim		= rtl8192f_set_tim,
+ 	.set_key		= rtl8192f_set_key,
+ 	.sw_scan_start		= rtl8192f_sw_scan_start,
+ 	.sw_scan_complete	= rtl8192f_sw_scan_complete,
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+@@ -1265,6 +1265,9 @@ void rtl8192f_tx_isr(struct rtl8192f_soc
+ void rtl8192f_rx_isr(struct rtl8192f_soc_priv *priv);
+ void rtl8192f_beacon_upload(struct rtl8192f_soc_priv *priv,
+ 			    struct sk_buff *skb);
++bool rtl8192f_beacon_tim_update(struct rtl8192f_soc_priv *priv,
++				const struct sk_buff *skb, u16 tim_off,
++				u16 tim_len);
+ 
+ /* ------------------------------------------------------------------ */
+ /* calib.c - IQK / calibration                                         */
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
+@@ -2123,6 +2123,36 @@ void rtl8192f_tx_watch_stop(struct rtl81
+  */
+ #define RTL8192F_BCN_HW_RATE	0x04
+ 
++/* Patch the TIM element of the resident beacon in place.
++ *
++ * This deliberately does not touch the TXBD, its PSLEN or BCN_OWN: the core
++ * re-reads this buffer at every TBTT, and a renewal that gates the slot while
++ * it is fetching is what previously cost beacons (see
++ * rtl8192f_beacon_upload()).  Only a same-length change can be applied this
++ * way, which is the usual case - the TIM bitmap width only moves when the
++ * highest buffered AID crosses a byte boundary - so anything else is refused
++ * and left to the next template renewal.
++ */
++bool rtl8192f_beacon_tim_update(struct rtl8192f_soc_priv *priv,
++				const struct sk_buff *skb, u16 tim_off,
++				u16 tim_len)
++{
++	struct rtl8192f_bcn_slot *bcn = &priv->bcn;
++	bool updated = false;
++
++	if (!tim_off || !tim_len || skb->len != READ_ONCE(bcn->frame_len))
++		return false;
++
++	spin_lock_bh(&priv->irq_lock);
++	if (tim_off + tim_len <= bcn->frame_len) {
++		memcpy(bcn->frame + tim_off, skb->data + tim_off, tim_len);
++		updated = true;
++	}
++	spin_unlock_bh(&priv->irq_lock);
++
++	return updated;
++}
++
+ void rtl8192f_beacon_upload(struct rtl8192f_soc_priv *priv,
+ 			    struct sk_buff *skb)
+ {

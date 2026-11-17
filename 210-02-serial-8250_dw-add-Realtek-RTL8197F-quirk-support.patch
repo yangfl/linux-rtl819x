@@ -1,0 +1,258 @@
+From 6c5c769a52ef55ef0bbdd9d166cb14de9c78f92c Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 30 Sep 2026 02:45:07 +0800
+Subject: [PATCH 2/2] serial: 8250_dw: add Realtek RTL8197F quirk support
+
+The RTL8197F integrates a DesignWare APB UART that differs from the
+generic snps,dw-apb-uart only in the location of the data register: the
+TX/RX FIFO sits at byte offset 0x24 (register index 9 with the word stride
+described by reg-shift = 2), leaving index 0 to hold DLL unconditionally.
+Everything else is the stock DW IP: USR at index 0x1f, Busy Detect on LCR
+writes with the same IIR busy encoding and read-USR clear, and standard
+DLM/IER sharing under DLAB.
+
+Model this as a dw8250 quirk rather than carrying a separate driver, in
+line with the existing Octeon and APMC0D08 per-IP overrides:
+
+  - a DW_UART_QUIRK_RTL8197F bit installs 32-bit accessors that remap
+    UART_TX/UART_RX onto index 9 before the reg-shift, and explicit
+    dl_read/dl_write that bypass the remap so the divisor latch is reached
+    at its own offset (dw8250_set_divisor() keeps DLAB handling as usual);
+  - the port is configured as a fixed 16550A with a 16-byte FIFO, and
+    dw8250_setup_port() is skipped because the DW extended registers it
+    probes (DLF, UCV, CPR) are not documented for this IP;
+  - busy-detect handling needs no new code: dw8250_handle_irq() and
+    dw8250_check_lcr() already implement the read-USR / LCR re-write
+    sequence against the same USR index.
+
+The early console for this IP moves in here as well.  The generic
+uart8250 earlycon writes the divisor latch at offset 0, which on this part
+is not the latch, so it needs the same register remap; the polling loop
+acknowledges the transmitter through LSR only, so a stuck FIFO cannot
+stall early boot (port->fifosize and the fixed type are set from the quirk
+data, and dw8250_early_write() retries a bounded 30000 times).
+
+Finally, SERIAL_8250_DW defaults on for MACH_REALTEK_RTL819X, since that
+is the only driver that can reach the port.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/tty/serial/8250/8250_dw.c |  146 +++++++++++++++++++++++++++++++++++++
+ drivers/tty/serial/8250/Kconfig   |    1 
+ 2 files changed, 147 insertions(+)
+
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -12,6 +12,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/bits.h>
+ #include <linux/cleanup.h>
++#include <linux/console.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+@@ -21,6 +22,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/processor.h>
+ #include <linux/property.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
+@@ -44,6 +46,12 @@
+ #define RZN1_UART_xDMACR_8_WORD_BURST	(2 << 1)
+ #define RZN1_UART_xDMACR_BLK_SZ(x)	((x) << 3)
+ 
++/* Realtek RTL8197F: register index of the TX/RX FIFO register.  With
++ * reg-shift = 2 this lands on byte offset 0x24; index 0 then always
++ * holds DLL instead of being overlaid by the data register.
++ */
++#define RTL8197F_UART_TX_RX	9
++
+ /* Quirks */
+ #define DW_UART_QUIRK_OCTEON		BIT(0)
+ #define DW_UART_QUIRK_ARMADA_38X	BIT(1)
+@@ -52,6 +60,7 @@
+ #define DW_UART_QUIRK_APMC0D08		BIT(4)
+ #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
+ #define DW_UART_QUIRK_IER_KICK		BIT(6)
++#define DW_UART_QUIRK_RTL8197F		BIT(8)
+ #define DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ	BIT(7)
+ 
+ /*
+@@ -371,6 +380,54 @@ static u32 dw8250_serial_in32be(struct u
+ }
+ 
+ /*
++ * On the RTL8197F the TX/RX FIFO register sits at index 9 (byte offset
++ * 0x24 with reg-shift = 2) instead of index 0, which always holds DLL.
++ * The 8250 core passes unshifted register indices, so remap the index
++ * before shifting and let the standard 32-bit accessors do the rest;
++ * this composes with whatever reg-shift the DT describes.
++ */
++static unsigned int rtl8197f_modify_offset(unsigned int offset)
++{
++	if (offset == UART_TX || offset == UART_RX)
++		return RTL8197F_UART_TX_RX;
++
++	return offset;
++}
++
++static u32 dw8250_serial_in32_rtl8197f(struct uart_port *p, unsigned int offset)
++{
++	return dw8250_serial_in32(p, rtl8197f_modify_offset(offset));
++}
++
++static void dw8250_serial_out32_rtl8197f(struct uart_port *p,
++					 unsigned int offset, u32 value)
++{
++	dw8250_serial_out32(p, rtl8197f_modify_offset(offset), value);
++}
++
++/*
++ * The divisor latch registers are not overlaid with the data register on
++ * this UART: DLL lives at its own offset 0 (the TX/RX FIFO was moved
++ * away from it), and DLM shares index 1 with IER under DLAB like a
++ * standard 8250.  serial_out(UART_DLL) would therefore be remapped onto
++ * the TX FIFO, so supply explicit dl_read/dl_write that bypass the
++ * remap; dw8250_set_divisor() sets DLAB before calling them.
++ */
++static u32 rtl8197f_serial_dl_read(struct uart_8250_port *up)
++{
++	return readl(up->port.membase + (UART_DLL << up->port.regshift)) |
++	       readl(up->port.membase + (UART_DLM << up->port.regshift)) << 8;
++}
++
++static void rtl8197f_serial_dl_write(struct uart_8250_port *up, u32 value)
++{
++	writel(value & 0xff,
++	       up->port.membase + (UART_DLL << up->port.regshift));
++	writel((value >> 8) & 0xff,
++	       up->port.membase + (UART_DLM << up->port.regshift));
++}
++
++/*
+  * INTC10EE UART can IRQ storm while reporting IIR_NO_INT. Inducing IIR value
+  * change has been observed to break the storm.
+  *
+@@ -615,6 +672,28 @@ static void dw8250_quirks(struct uart_po
+ 		p->serial_in = dw8250_serial_in32;
+ 		data->uart_16550_compatible = true;
+ 	}
++	if (quirks & DW_UART_QUIRK_RTL8197F) {
++		struct uart_8250_port *up = up_to_u8250p(p);
++
++		p->iotype = UPIO_MEM32;
++		p->serial_in = dw8250_serial_in32_rtl8197f;
++		p->serial_out = dw8250_serial_out32_rtl8197f;
++		up->dl_read = rtl8197f_serial_dl_read;
++		up->dl_write = rtl8197f_serial_dl_write;
++
++		p->type = PORT_16550A;
++		p->flags |= UPF_FIXED_TYPE | UPF_SKIP_TEST;
++		p->fifosize = 16;
++
++		/*
++		 * The DW APB extended registers probed by
++		 * dw8250_setup_port() (DLF, UCV, CPR) are not documented
++		 * for this IP, so skip the probe and keep the fixed
++		 * configuration above; divisor setup still goes through
++		 * dw8250_set_divisor().
++		 */
++		data->skip_autocfg = true;
++	}
+ }
+ 
+ static void dw8250_reset_control_assert(void *data)
+@@ -902,10 +981,16 @@ static const struct dw8250_platform_data
+ 	.quirks = DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ,
+ };
+ 
++static const struct dw8250_platform_data dw8250_rtl8197f_data = {
++	.usr_reg = DW_UART_USR,
++	.quirks = DW_UART_QUIRK_RTL8197F,
++};
++
+ static const struct of_device_id dw8250_of_match[] = {
+ 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
+ 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
+ 	{ .compatible = "marvell,armada-38x-uart", .data = &dw8250_armada_38x_data },
++	{ .compatible = "realtek,rtl8197f-uart", .data = &dw8250_rtl8197f_data },
+ 	{ .compatible = "renesas,rzn1-uart", .data = &dw8250_renesas_rzn1_data },
+ 	{ .compatible = "sophgo,sg2044-uart", .data = &dw8250_skip_set_rate_data },
+ 	{ .compatible = "starfive,jh7100-uart", .data = &dw8250_skip_set_rate_data },
+@@ -957,3 +1042,64 @@ MODULE_AUTHOR("Jamie Iles");
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Synopsys DesignWare 8250 serial port driver");
+ MODULE_ALIAS("platform:dw-apb-uart");
++
++/*
++ * Earlycon for the RTL8197F bootloader-initialized port: the generic
++ * uart8250 earlycon writes into the divisor latch (offset 0 only holds
++ * DLL here) and stays silent, so poll LSR.THRE at its usual slot and
++ * write the FIFO at its remapped one.  No line configuration is
++ * attempted.
++ *
++ *   earlycon=rtl8197f,mmio32,<phys-addr>   (UART0: 0x18147000)
++ */
++#define RTL8197F_EARLYCON_LSR	0x14
++#define RTL8197F_EARLYCON_TX	0x24
++
++/*
++ * The vendor earlycon gives up after 30000 busy polls and resets the
++ * FIFO via FCR.TXRST; without that a wedged FIFO hangs the whole boot
++ * with no output and no recovery.
++ */
++#define RTL8197F_EARLYCON_MAX_RETRY	30000
++#define RTL8197F_EARLYCON_FCR		0x08
++#define RTL8197F_EARLYCON_FCR_TXRST	BIT(2)
++#define RTL8197F_EARLYCON_FCR_FIFOE	BIT(0)
++
++static void rtl8197f_earlycon_putc(struct uart_port *port, unsigned char ch)
++{
++	unsigned int retry = RTL8197F_EARLYCON_MAX_RETRY;
++
++	while (!(readl_relaxed(port->membase + RTL8197F_EARLYCON_LSR) &
++		 UART_LSR_THRE)) {
++		if (!retry--) {
++			writel_relaxed(RTL8197F_EARLYCON_FCR_TXRST |
++				       RTL8197F_EARLYCON_FCR_FIFOE,
++				       port->membase + RTL8197F_EARLYCON_FCR);
++			retry = RTL8197F_EARLYCON_MAX_RETRY;
++		}
++		cpu_relax();
++	}
++
++	writel_relaxed(ch, port->membase + RTL8197F_EARLYCON_TX);
++}
++
++static void rtl8197f_earlycon_write(struct console *con, const char *s,
++				    unsigned int count)
++{
++	struct earlycon_device *dev = con->data;
++
++	uart_console_write(&dev->port, s, count, rtl8197f_earlycon_putc);
++}
++
++static int __init rtl8197f_earlycon_setup(struct earlycon_device *dev,
++					  const char *opt)
++{
++	if (!dev->port.membase)
++		return -ENODEV;
++
++	dev->con->write = rtl8197f_earlycon_write;
++
++	return 0;
++}
++EARLYCON_DECLARE(rtl8197f, rtl8197f_earlycon_setup);
++OF_EARLYCON_DECLARE(rtl8197f, "realtek,rtl8197f-uart", rtl8197f_earlycon_setup);
+--- a/drivers/tty/serial/8250/Kconfig
++++ b/drivers/tty/serial/8250/Kconfig
+@@ -406,6 +406,7 @@ config SERIAL_8250_DFL
+ config SERIAL_8250_DW
+ 	tristate "Support for Synopsys DesignWare 8250 quirks"
+ 	depends on SERIAL_8250
++	default MACH_REALTEK_RTL819X
+ 	select SERIAL_8250_DWLIB
+ 	help
+ 	  Selecting this option will enable handling of the extra features

@@ -1,0 +1,118 @@
+From 9b18d43b4885e89d421746e69eccedb1717472c7 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 29 Sep 2026 18:08:44 +0800
+Subject: [PATCH] dt-bindings: soc: add Realtek RTL8197F embedded switch
+
+Document the RTL8197F embedded switch block: no switch management is
+implemented, and the driver performs its own minimal bring-up instead
+of inheriting whatever stage ran before it - the reset sequence gates
+the core clock off and back on, so the clocks property naming the
+"swcore" gate is required.
+
+The CPU interface is a port of the switch (logical port 8) that is not a
+netdevice of its own: the port names the Ethernet MAC carrying its frames
+with an "ethernet" phandle, which is how the two sides of that link refer
+to each other without sharing code.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../soc/realtek/realtek,rtl8197f-switch.yaml       |   93 ++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create Documentation/devicetree/bindings/soc/realtek/realtek,rtl8197f-switch.yaml
+
+--- /dev/null
++++ b/Documentation/devicetree/bindings/soc/realtek/realtek,rtl8197f-switch.yaml
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/soc/realtek/realtek,rtl8197f-switch.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Realtek RTL8197F embedded Ethernet switch
++
++maintainers:
++  - David Yang <mmyangfl@gmail.com>
++
++description: |
++  The RTL8197F contains a 5+1 port Ethernet switch at a dedicated bus
++  window outside the internal peripheral bus.  No switch management
++  (L2, VLAN, offload) is implemented, but the driver does reset the
++  switch core on probe and performs the minimal bring-up the CPU-port
++  NIC (realtek,rtl8197f-eth) depends on, instead of inheriting the
++  bootloader's configuration.  The node must be enabled whenever the
++  Ethernet MAC is used.
++
++  The CPU interface is a port of this switch, not a netdevice of its own:
++  frames it forwards only reach the host through the Ethernet MAC wired to
++  it, which is why the CPU port names that MAC with an "ethernet" phandle.
++
++properties:
++  compatible:
++    const: realtek,rtl8197f-switch
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    maxItems: 1
++
++  ports:
++    type: object
++    additionalProperties: false
++    properties:
++      "#address-cells":
++        const: 1
++      "#size-cells":
++        const: 0
++    patternProperties:
++      '^port@[0-9]$':
++        type: object
++        description: CPU interface port of the switch.
++        additionalProperties: false
++        properties:
++          reg:
++            description: Logical port number (the CPU interface is port 8).
++            minItems: 1
++            maxItems: 1
++          ethernet:
++            $ref: /schemas/types.yaml#/definitions/phandle
++            description:
++              phandle of the Ethernet MAC (realtek,rtl8197f-eth) that carries
++              this port's frames; the driver arms the switch-side descriptor
++              trigger for that interface.
++        required:
++          - reg
++          - ethernet
++    required:
++      - "#address-cells"
++      - "#size-cells"
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - ports
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/realtek-rtl819x-clks.h>
++
++    switch@1b800000 {
++        compatible = "realtek,rtl8197f-switch";
++        reg = <0x1b800000 0x500000>;
++        clocks = <&sysclk RTL8197F_CLK_SWCORE>;
++
++        ports {
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            port@8 {
++                reg = <8>;
++                ethernet = <&eth0>;
++            };
++        };
++    };
++...

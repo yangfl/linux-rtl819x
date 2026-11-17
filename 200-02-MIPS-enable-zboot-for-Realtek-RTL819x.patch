@@ -1,0 +1,62 @@
+From d5bfa7e0ec5eef27460d7057b96253a4d2ef4f23 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Wed, 30 Sep 2026 02:34:43 +0800
+Subject: [PATCH 2/2] MIPS: enable zboot for Realtek RTL819x
+
+The RTL819x SoCs use a standard 16550 UART, so enable the zboot
+compressed-image infrastructure for the platform.  SYS_SUPPORTS_ZBOOT
+selects the HAVE_KERNEL_* symbols, which in turn pull in the matching
+DECOMPRESS_* library code; no further dependency is needed.  Add the PORT()
+macro the decompressor's early output needs for them: UART0 sits at
+0x18147000, and the CKSEG1ADDR alias is what the stub can touch before the
+kernel mapping exists.
+
+Give ZBOOT_LOAD_ADDRESS a platform default of 0x81300000.  The boot code on
+these boards enters the image where it was loaded and cannot relocate it,
+so the compressed kernel has to be linked for that address.  The generic
+platform kernel then decompresses downwards to its load address
+0x80100000, which leaves 18 MiB between the decompression target and the
+input; the gap has to exceed the largest decompressed kernel this board is
+meant to boot, otherwise the decompressor overwrites input it has not read
+yet.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ arch/mips/Kconfig                      |    4 ++++
+ arch/mips/boot/compressed/uart-16550.c |    5 +++++
+ 2 files changed, 9 insertions(+)
+
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -729,6 +729,9 @@ config MACH_REALTEK_RTL819X
+ 	select USE_OF
+ 	select COMMON_CLK
+ 	select IRQ_REALTEK_RTL819X
++	select SYS_SUPPORTS_ZBOOT
++	select SYS_SUPPORTS_ZBOOT_UART16550
++	select DEBUG_ZBOOT if DEBUG_KERNEL
+ 	select HAVE_PCI
+ 	select BUILTIN_DTB if MIPS_NO_APPENDED_DTB
+ 	select USB_EHCI_BIG_ENDIAN_DESC if USB_SUPPORT
+@@ -2130,6 +2133,7 @@ config MIPS_VA_BITS_48
+ config ZBOOT_LOAD_ADDRESS
+ 	hex "Compressed kernel load address"
+ 	default 0xffffffff80400000 if BCM47XX
++	default 0x81300000 if MACH_REALTEK_RTL819X
+ 	default 0x0
+ 	depends on SYS_SUPPORTS_ZBOOT
+ 	help
+--- a/arch/mips/boot/compressed/uart-16550.c
++++ b/arch/mips/boot/compressed/uart-16550.c
+@@ -20,6 +20,11 @@
+ #define PORT(offset) (CKSEG1ADDR(INGENIC_UART_BASE_ADDR) + (4 * offset))
+ #endif
+ 
++#ifdef CONFIG_MACH_REALTEK_RTL819X
++#define RTL819X_UART_BASE	0x18147000
++#define PORT(offset)	(CKSEG1ADDR(RTL819X_UART_BASE) + (4 * (offset)))
++#endif
++
+ #ifdef CONFIG_ECONET
+ #define EN75_UART_BASE	0x1fbf0003
+ #define PORT(offset)	(CKSEG1ADDR(EN75_UART_BASE) + (4 * (offset)))

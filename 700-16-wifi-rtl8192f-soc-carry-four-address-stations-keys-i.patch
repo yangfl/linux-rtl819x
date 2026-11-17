@@ -1,0 +1,185 @@
+From a761af059fddbb32cfe97664fbc96dbfb9b00832 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 9 Oct 2026 03:40:21 +0800
+Subject: [PATCH 16/19] wifi: rtl8192f-soc: carry four-address stations, keys in
+ software
+
+Four-address support needs no peer box to check: the client half of
+the exchange is
+mac80211's own use_4addr (net/mac80211/cfg.c 282-298 takes it for a STATION
+interface, which is what "iw dev <if> set 4addr on" sends), so one
+associated client speaks both forms.
+
+Nothing was needed on the frame path either: lengths come from
+ieee80211_hdrlen() on both sides (txrx.c 780, 1116, 1666) and RCR_AAP is
+set (hw.c 802), so the driver only had to stop refusing the interface type.
+The flag is only honoured at interface creation, because cfg80211 will not
+change a VLAN afterwards ("don't support changing VLANs, you just re-create
+them", net/wireless/util.c 478-480).
+
+A four-address station therefore keeps its key in software, and
+sta_set_4addr is the only thing that makes that decidable - the vif
+mac80211 hands to set_key() is the interface the key was requested on, not
+the VLAN the station lives on.  One limit cannot be fixed from a driver:
+ieee80211_set_sta_4addr() just calls the driver (net/mac80211/cfg.c
+2785-2791) and never re-installs the key, so a station switched into
+four-address form after its handshake keeps the hardware entry and stays
+unreachable until it re-associates.  The working order is therefore to be
+carried on the VLAN from the association onwards.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ .../net/wireless/realtek/rtl8192f-soc/core.c  | 44 ++++++++++++++++++-
+ .../realtek/rtl8192f-soc/rtl8192f_soc.h       |  5 +++
+ .../net/wireless/realtek/rtl8192f-soc/sec.c   | 22 ++++++++++
+ .../net/wireless/realtek/rtl8192f-soc/txrx.c  |  9 ++++
+ 4 files changed, 79 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/core.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/core.c
+@@ -249,10 +249,25 @@ int rtl8192f_add_interface(struct ieee80
+ 	bool extra_bss, readded;
+ 	u8 mbid;
+ 
++	/* A four-address (WDS-style) station is carried on an AP_VLAN of the AP
++	 * that moved it there, and the VLAN needs no hardware state of its own:
++	 * still one BSS, one beacon slot, one REG_MACID, no address CAM entry.
++	 * mac80211 builds the 30-octet RA/TA/DA/SA header itself, this driver
++	 * sizes both directions from ieee80211_hdrlen() (txrx.c) and sets
++	 * RCR_AAP (hw.c), so nothing on the frame path is special - only the
++	 * pairwise key is (rtl8192f_sta_set_4addr, rtl8192f_set_key).
++	 *
++	 * The vendor's WDS is a different thing and is not ported: its own
++	 * netdevs driven by iwpriv mib keys, a mapping key whose PSK is salted
++	 * with a literal string, and in the tree used as the reference it is
++	 * not compiled at all.
++	 */
+ 	switch (vif->type) {
+ 	case NL80211_IFTYPE_STATION:
+ 	case NL80211_IFTYPE_AP:
+ 		break;
++	case NL80211_IFTYPE_AP_VLAN:
++		return 0;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -369,6 +384,12 @@ void rtl8192f_remove_interface(struct ie
+ 		rtl8192f_mbidcam_write(priv, rvif->mbid + 1, NULL, false);
+ 		clear_bit(rvif->mbid, priv->bssid_map);
+ 		rvif->mbid_set = false;
++	} else if (vif != priv->bss_vif) {
++		/* A VLAN took no slot and owns no part of the address set, so
++		 * taking it down must not re-sample the CAM of the BSS that is
++		 * still up.
++		 */
++		return;
+ 	}
+ 
+ 	if (vif != priv->bss_vif) {
+@@ -446,6 +467,25 @@ static void rtl8192f_set_bssid(struct rt
+ 			 addr[4] | (addr[5] << 8));
+ }
+ 
++/* Remember that this station is carried in four-address form.
++ *
++ * mac80211 sets up the RA/TA/DA/SA header itself for a station that lives on
++ * an AP_VLAN created with NL80211_ATTR_4ADDR (net/mac80211/tx.c
++ * __ieee80211_data_to_8023()); what it tells the driver is only this flag, and
++ * only when the station is moved onto such a VLAN with
++ * NL80211_CMD_SET_STATION (net/mac80211/cfg.c ieee80211_set_sta_4addr).  The
++ * answer decides where the station's pairwise key goes: the in-core engine
++ * cannot carry the extra address on transmit (rtl8192f_set_key()).
++ */
++static void rtl8192f_sta_set_4addr(struct ieee80211_hw *hw,
++				   struct ieee80211_vif *vif,
++				   struct ieee80211_sta *sta, bool enabled)
++{
++	struct rtl8192f_sta *rsta = (struct rtl8192f_sta *)sta->drv_priv;
++
++	rsta->four_addr = enabled;
++}
++
+ int rtl8192f_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		       struct ieee80211_sta *sta,
+ 		       enum ieee80211_sta_state old_state,
+@@ -806,6 +846,7 @@ static const struct ieee80211_ops rtl819
+ 	.conf_tx		= rtl8192f_conf_tx,
+ 	.ampdu_action		= rtl8192f_ampdu_action,
+ 	.set_tim		= rtl8192f_set_tim,
++	.sta_set_4addr		= rtl8192f_sta_set_4addr,
+ 	.set_key		= rtl8192f_set_key,
+ 	.sw_scan_start		= rtl8192f_sw_scan_start,
+ 	.sw_scan_complete	= rtl8192f_sw_scan_complete,
+@@ -1104,7 +1145,8 @@ static int rtl8192f_soc_probe(struct pla
+ 	hw->vif_data_size = sizeof(struct rtl8192f_vif);
+ 	hw->sta_data_size = sizeof(struct rtl8192f_sta);
+ 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
+-				     BIT(NL80211_IFTYPE_AP);
++				     BIT(NL80211_IFTYPE_AP) |
++				     BIT(NL80211_IFTYPE_AP_VLAN);
+ 	/* Several BSSIDs share this one radio and its single beacon slot, so
+ 	 * the combination is a set of AP interfaces on one channel; a station
+ 	 * interface takes the slot alone (see rtl8192f_add_interface()).
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+@@ -795,6 +795,11 @@ struct rtl8192f_vif {
+  */
+ struct rtl8192f_sta {
+ 	u8 macid;
++	/* Set by sta_set_4addr for a station carried on a four-address
++	 * AP_VLAN.  It decides where its pairwise key lives - see
++	 * rtl8192f_set_key().
++	 */
++	bool four_addr;
+ };
+ 
+ /* Beacon single slot: one TXBD (128B stride area) + one 40B TX info
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/sec.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/sec.c
+@@ -199,6 +199,28 @@ int rtl8192f_set_key(struct ieee80211_hw
+ 		goto out;
+ 	}
+ 
++	if (((struct rtl8192f_sta *)sta->drv_priv)->four_addr) {
++		/* The engine cannot be made to encrypt for a four-address
++		 * station: with the key in the CAM such a station passes nothing in
++		 * either direction, while the same station in three-address form works
++		 * (measured).  Receive is not the problem - the descriptor reports
++		 * four-address frames decrypted with no ICV error, so the AAD the
++		 * engine checks covers the extra address - and the failure is
++		 * transmit-only.  There is no knob left for the host: the
++		 * header-geometry field of this descriptor family, DW3[4:0]
++		 * ("unit: 2 bytes", Hal88XXTxDesc.c 959, 1209) was tried with the
++		 * vendor's own encoding and changed nothing on either leg, and the
++		 * reference build never writes that field outside the MAC-V2
++		 * hardware-shortcut branch.  So the key stays in software for these
++		 * stations.  Note that mac80211 cannot move a key that was already
++		 * handed over (ieee80211_set_sta_4addr() only calls the driver), so a
++		 * station put into four-address form after its key was installed
++		 * keeps that key and stays broken until it re-associates.
++		 */
++		ret = 1;
++		goto out;
++	}
++
+ 	entry = rtl8192f_cam_slot(priv, key);
+ 	if (entry < 0)
+ 		entry = find_next_zero_bit(priv->cam_map, CAM_ENTRIES,
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
+@@ -756,6 +756,15 @@ void rtl8192f_txrx_stop(struct rtl8192f_
+  * (RX_DW0_SECURITY_SH / RX_DW0_SWDEC_SH, HalComRXDesc.h 74/78) - the
+  * same pair of fields rtw88 rx.c 286 tests.  CAM_ALG_NONE is the value
+  * a frame the engine did not touch reports.
++ *
++ * Neither test depends on how many addresses the header carries, and
++ * the engine does decrypt four-address frames: the protected
++ * four-address frames a client sources come up with a security type
++ * other than NONE and without RXD_W0_ICV_ERR, so the AAD the engine
++ * checks covers the fourth address.  Only receive - the transmit half
++ * is not four-address aware (rtl8192f_set_key()), which is why a
++ * four-address station has no CAM entry today and never reaches this
++ * path in hardware.
+  */
+ static bool rtl8192f_rx_hw_decrypted(__le32 rxdesc_w0)
+ {

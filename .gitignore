@@ -1,0 +1,4 @@
+.pc/
+*.orig
+*.rej
+/series

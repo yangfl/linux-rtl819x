@@ -1,0 +1,2018 @@
+From fead70be44f6106501e694b584e1164301bfa9b6 Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Fri, 9 Oct 2026 03:40:14 +0800
+Subject: [PATCH 2/19] wifi: rtl8192f-soc: add the driver scaffolding and the init
+ tables
+
+Add a mac80211 driver for the 802.11bgn 1T1R WiFi core integrated in
+the Realtek RTL8197F router SoC.  The core belongs to the RTL8192F
+(gen 2.5) family and is wired directly to the SoC bus, so neither the
+PCIe plumbing of rtlwifi/rtw88 nor their descriptor layout applies.
+The driver arrives as one patch per layer, each of which compiles and
+links against the previous ones; the device only becomes usable with the
+last one, which registers the platform driver and the mac80211
+interface.  Everything this patch declares - the register and bit maps,
+the descriptor layouts, the per-device struct and the function
+prototypes - is consumed by the patches that follow, so none of it is
+reachable yet.
+
+This patch adds the scaffolding: Kconfig and Makefile, the driver
+header with the MAC register map, the descriptor field layouts and the
+per-device state, and the three register init tables that the bring-up
+sequence consumes - MAC byte writes, baseband/AGC 32-bit writes and RF
+register writes.  The tables are transcribed row-by-row from the
+vendor PHYDM MP image for the 8197F.  That image is a
+conditional-lookup format whose IF/ELSE markers select a board package
+and silicon cut; for this SoC (package type 0, cut A, internal PA) the
+vendor apply loop takes the ELSE branch of every block, so each table
+here is that ELSE content in the original order.  RF rows at address
+0xffe are the vendor 50 ms settling markers, which the apply code
+turns into delays rather than writes.
+
+Two entries are board-derived and say so in place: 0x4CA and 0x4CB cap
+the aggregation number globally and bind whatever a TX descriptor
+requests, and the value that works is 0x20 - what the running factory
+firmware holds - not the 0x10 in the init image.
+
+The driver takes its two SoC-side clocks from the clock provider
+added earlier in this series; it never maps the system controller
+itself.
+
+No functional change is reachable from this patch: the tables are only
+referenced by the bring-up code added later.
+
+Signed-off-by: David Yang <mmyangfl@gmail.com>
+---
+ drivers/net/wireless/realtek/Kconfig          |   1 +
+ drivers/net/wireless/realtek/Makefile         |   1 +
+ .../net/wireless/realtek/rtl8192f-soc/Kconfig |  12 +
+ .../wireless/realtek/rtl8192f-soc/Makefile    |   3 +
+ .../realtek/rtl8192f-soc/rtl8192f_soc.h       | 991 ++++++++++++++++++
+ .../wireless/realtek/rtl8192f-soc/tables_bb.c | 635 +++++++++++
+ .../realtek/rtl8192f-soc/tables_mac.c         | 178 ++++
+ .../wireless/realtek/rtl8192f-soc/tables_rf.c | 100 ++
+ 8 files changed, 1921 insertions(+)
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/Kconfig
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/Makefile
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/tables_bb.c
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/tables_mac.c
+ create mode 100644 drivers/net/wireless/realtek/rtl8192f-soc/tables_rf.c
+
+--- a/drivers/net/wireless/realtek/Kconfig
++++ b/drivers/net/wireless/realtek/Kconfig
+@@ -14,6 +14,7 @@ if WLAN_VENDOR_REALTEK
+ 
+ source "drivers/net/wireless/realtek/rtl818x/Kconfig"
+ source "drivers/net/wireless/realtek/rtlwifi/Kconfig"
++source "drivers/net/wireless/realtek/rtl8192f-soc/Kconfig"
+ source "drivers/net/wireless/realtek/rtl8xxxu/Kconfig"
+ source "drivers/net/wireless/realtek/rtw88/Kconfig"
+ source "drivers/net/wireless/realtek/rtw89/Kconfig"
+--- a/drivers/net/wireless/realtek/Makefile
++++ b/drivers/net/wireless/realtek/Makefile
+@@ -6,6 +6,7 @@
+ obj-$(CONFIG_RTL8180)		+= rtl818x/
+ obj-$(CONFIG_RTL8187)		+= rtl818x/
+ obj-$(CONFIG_RTLWIFI)		+= rtlwifi/
++obj-$(CONFIG_RTL8192F_SOC) += rtl8192f-soc/
+ obj-$(CONFIG_RTL8XXXU)		+= rtl8xxxu/
+ obj-$(CONFIG_RTW88)		+= rtw88/
+ obj-$(CONFIG_RTW89)		+= rtw89/
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/Kconfig
+@@ -0,0 +1,12 @@
++config RTL8192F_SOC
++	tristate "Realtek RTL8192F-SoC (RTL8197F integrated) wireless support"
++	depends on MAC80211
++	depends on MIPS || COMPILE_TEST
++	help
++	  This adds support for the 802.11bgn 1T1R WiFi core integrated in
++	  the Realtek RTL8197F router SoC.  The core is a member of the
++	  RTL8192F (gen-2.5) family wired directly to the SoC bus with a
++	  PCI-style descriptor DMA engine.
++
++	  If you choose to build it as a module, it will be called
++	  rtl8192f_soc.
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/Makefile
+@@ -0,0 +1,3 @@
++rtl8192f_soc-y := tables_mac.o tables_bb.o tables_rf.o
++
++obj-$(CONFIG_RTL8192F_SOC) += rtl8192f_soc.o
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+@@ -0,0 +1,991 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * RTL8192F-SoC (RTL8197F integrated 802.11bgn 1T1R) mac80211 driver
++
++ * The WiFi core embedded in the RTL8197F router SoC is a member of the
++ * RTL8192F (gen-2.5) family wired directly to the SoC bus.  Its DMA
++ * engine uses the 88XX "new BD" dual-ring model (32-byte TXBD + 40-byte
++ * TX info descriptor, 8-byte RXBD + 24-byte RX info descriptor in the
++ * buffer), not the rtlwifi PCI in-descriptor OWN model.  Register maps
++ * and init tables match the USB RTL8192F sibling supported by rtl8xxxu;
++ * the bus and data path do not.
++ */
++
++#ifndef __RTL8192F_SOC_H
++#define __RTL8192F_SOC_H
++
++#include <linux/atomic.h>
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/workqueue.h>
++#include <linux/dma-mapping.h>
++#include <linux/ieee80211.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of_net.h>
++#include <linux/platform_device.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++#include <net/mac80211.h>
++
++/* ------------------------------------------------------------------ */
++/* MAC register offsets (RTL8192C lineage, extended for gen-2.5)       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * MAC register offsets.  Single source of truth for the whole driver
++ * : hw.c and core.c must not carry
++ * local copies.  Offsets/names follow vendor 8192c_reg.h unless
++ * noted otherwise.
++ */
++#define REG_SYS_ISO_CTRL		0x0000
++#define REG_AFE_MISC			0x0010
++#define REG_SYS_FUNC_EN			0x0002
++#define REG_APS_FSMCO			0x0004
++#define REG_SYS_CLKR			0x0008
++/* 88xx family naming (vendor HalComReg.h REG_SYS_CLKR / REG_SDIO_CTRL);
++ * the 92c-style 0x0008 above is a different register on this core.
++ */
++#define REG_SYS_CLKR_88XX		0x0070
++#define REG_RSV_CTRL			0x001C
++#define REG_LDOA15_CTRL			0x0020
++#define  LDOA15_ENABLE			BIT(0)
++#define REG_RF_CTRL			0x001F
++#define REG_LDOHCI12_CTRL		0x0022
++#define REG_EFUSE_CTRL			0x0030	/* EFUSE_CTRL 0x030 */
++#define REG_EFUSE_TEST			0x0034
++#define REG_LEDCFG			0x004C
++#define REG_LDO_SW_CTRL			0x007C	/* rtl8xxxu regs.h: LDO
++						 * settings; 0x7c[31]=1 "LDO
++						 * has max output capability"
++						 * (rtl8xxxu 8192f.c:1655).
++						 * Vendor 8192c_reg.h carries
++						 * no name for 0x7C.
++						 */
++#define REG_SYS_CLK_CTRL		0x0008
++/* 0x0008[14] (BIT_CPU_CLK_EN, halmac_bit2.h 826): clock enable for the
++ * in-core MIPS CPU that runs the transmit scheduler on the 8197F.
++ */
++#define REG_CPU_CLK_EN			BIT(14)
++#define REG_MCUFWDL			0x0080
++#define REG_CR				0x0100
++/* Network type sits in REG_CR bits[17:16] - i.e. byte 0x102, which the
++ * 16-bit CR RMWs used elsewhere never cover (Hal88XXGen.c 5234,
++ * BIT_SHIFT_NETYPE0 = 16, MASK = 0x3; MSR values HalComBit.h 48).
++ */
++#define REG_MSR				0x0102
++#define MSR_NOLINK			0x00
++#define MSR_INFRA			0x01
++#define MSR_ADHOC			0x02
++#define MSR_AP				0x03
++/* REG_PBP (0x0104) deliberately absent: on the 8197F the TX page size
++ * is fixed in hardware, vendor does not write it (Hal88XXGen.c puts
++ * both PBP writes inside #if 0, "TX page file already fixed in HW.
++ * No need to set register. Including old IC 8814A, 8197F").  The PSB
++ * divisor for the TXBD page count is 256 (HalCfg.h PBP_PSTX_SIZE).
++ */
++/* REG_TRXDMA_CTRL (0x010C, 88XX TXDMA_PQ_MAP): vendor InitMAC88XX()
++ * programs it on the 8197F with the queue map, RX shift enable and RX
++ * DMA arbitration burst width (Hal88XXGen.c 4927-4933).
++ */
++#define REG_TRXDMA_CTRL		0x010C
++/* TRX_DMA_QUEUE_MAP_PARA: VOQ/BEQ normal, VIQ/BKQ low, MGQ extra, HIQ
++ * high (HalCfg.h 560-594, default txbuf_merge off).
++ */
++#define TRX_DMA_QUEUE_MAP_PARA	0xc660
++#define BIT_RXDMA_ARBBW_EN	BIT(0)	/* HalComBit.h 8668-8669 */
++#define BIT_RXSHFT_EN		BIT(1)
++
++/* RX FIFO byte boundaries, vendor InitMAC88XX() (Hal88XXGen.c
++ * 4907-4918): the RX FIFO area of the 16K TX/RX FIFO must be told
++ * where it starts (TRXFF_BNDY high half) and ends (RXFF_BNDY low
++ * half); both get MAC_RXFF_SIZE.  Without them the RX DMA engine has
++ * no FIFO space and stays silent.
++ */
++#define REG_TRXFF_BNDY		0x0114
++#define REG_RXFF_BNDY		0x011C
++#define MAC_RXFF_SIZE		0x3e7f	/* HalCfg.h 552: 16K - 384 C2H - 1 */
++
++/* Interrupt registers, 88XX/8197F layout
++ * (vendor WlanHAL/HalMac88XX/halmac_reg2.h 422-425 and halmac_bit2.h
++ * 10855-10890/11147-11160).  Group 0 (0xB0/0xB4) carries RXOK, RDU and
++ * the per-queue TX done bits; RX/TX FIFO overflow (FOVW/TXFOVW) live in
++ * group 1 (0xB8/0xBC).  Both status registers are write-1-to-clear.
++ */
++#define REG_HIMR0		0x00B0	/* interrupt mask group 0 */
++#define REG_HISR0		0x00B4	/* interrupt status 0 (W1C) */
++#define REG_HIMR1		0x00B8	/* interrupt mask group 1 */
++#define REG_HISR1		0x00BC	/* interrupt status 1 (W1C) */
++/* Vendor 8197F is MAC_V2 and its ISR also services groups 2/3
++ * (Hal88XXIsr.c:101-107); this driver enables neither group.
++ */
++#define REG_TXDMA_STATUS	0x0210	/* TXDMA error latches (W1C):
++					 * BIT(12) DSC_CHKSUM_FAIL,
++					 * BIT(13) PAYLOAD_OVF,
++					 * BIT(14) PAYLOAD_UDN ("payload
++					 * is under the packet length of
++					 * Tx descriptor", 8192c_reg.h),
++					 * BIT(15) PAYLOAD_CHKSUM_ERR
++					 * (halmac_bit2.h 8197F section).
++					 * The vendor ISR read+write-
++					 * clears this in the TXFOVW and
++					 * TXERR branches; the read must
++					 * be preceded by a clear or it
++					 * reports stale bits.
++					 */
++/* HSISR mask (GPIO9/AXI-exception group, halmac_reg2.h 1789); the
++ * matching status register is REG_HSISR below.
++ */
++#define REG_HSIMR		0x0058
++/* HSISR status (W1C).  The vendor 8197F ISR always read+write-clears it
++ * (Hal88XXIsr.c 115-124); a latched, never-cleared HSISR bit keeps the
++ * aggregated line asserted with no driver-visible source.
++ */
++#define REG_HSISR		0x005C
++/* Firmware interrupt status (W1C).  FS_H2CCMD_INT (bit4) is asserted each
++ * time the in-core scheduler takes an H2C command off a mailbox;
++ * FS_TRXRPT_INT (bit7) is its TX-report indication.  Bit names from
++ * halmac_bit2.h's REG_FWISR block for HALMAC_8197F_SUPPORT.
++ */
++#define REG_FWISR		0x0134
++#define FWISR_H2CCMD		BIT(4)
++#define FWISR_TRXRPT		BIT(7)
++/* AXI bus exception cause / timestamp (8197F only, halmac_reg2.h
++ * 2683-2684, bits halmac_bit2.h 32849-32885: DECERR/SLVERR R/W and
++ * AXI_RXDMA_TIMEOUT).  Vendor never reads them; a non-zero value here
++ * names the bus master and address that wedged the SoC.
++ */
++#define REG_TXDMA_OFFSET_CHK		0x020C
++#define REG_RXDMA_STATUS		0x0288
++#define REG_RXDMA_MODE		0x0290
++#define REG_SYS_CFG			0x00F0
++
++/* ------------------------------------------------------------------ */
++/* 88XX "new BD" ring registers (0x300 block).  All offsets per vendor */
++/* WlanHAL/HalMac88XX/halmac_reg2.h 897-936 (8197F included); the  */
++/* kick/reap protocol matches mainline rtw88 pci.h/pci.c.              */
++/* ------------------------------------------------------------------ */
++
++/* TXBD ring base addresses (DESA), one per hardware queue */
++#define REG_BCNQ_TXBD_DESA		0x0308
++#define REG_MGQ_TXBD_DESA		0x0310
++#define REG_VOQ_TXBD_DESA		0x0318
++#define REG_VIQ_TXBD_DESA		0x0320
++#define REG_BEQ_TXBD_DESA		0x0328
++#define REG_BKQ_TXBD_DESA		0x0330
++#define REG_RXQ_RXBD_DESA		0x0338
++#define REG_HI0Q_TXBD_DESA		0x0340
++
++/* Ring length registers: bits[11:0] = number of entries,
++ * bits[13:12] = segment mode (0=2, 1=4, 2=8 elements per BD; vendor
++ * uses 1 everywhere, HalCfg.h TX_*_TXBD_MODE_SEL).  REG_RX_RXBD_NUM
++ * differs: bits[14:13] = BCNQ segment mode, bit[12] = HCI_BCNQ_FLAG,
++ * bit[15] = SYS_32_64 (halmac_bit2.h 18704-18769).
++ */
++#define REG_MGQ_TXBD_NUM		0x0380
++#define REG_RX_RXBD_NUM			0x0382
++#define REG_VOQ_TXBD_NUM		0x0384
++#define REG_VIQ_TXBD_NUM		0x0386
++#define REG_BEQ_TXBD_NUM		0x0388
++#define REG_BKQ_TXBD_NUM		0x038A
++#define REG_HI0Q_TXBD_NUM		0x038C
++
++/* TXBD_NUM / RX_RXBD_NUM bit fields (halmac_bit2.h 18710-18769) */
++#define TXBD_NUM_MASK			GENMASK(11, 0)
++#define TXBD_DESC_MODE_4SEG		BIT(12)		/* TX queues */
++#define RXBD_NUM_MASK			GENMASK(11, 0)
++#define BCNQ_DESC_MODE_4SEG		BIT(13)		/* bits[14:13] */
++#define RXBD_SYS_32_64			BIT(15)		/* 0 = 32-bit */
++
++/* Write 0xffffffff to reset all host + HW ring indices (same as
++ * mainline rtw88 pci.c RTK_PCI_TXBD_RWPTR_CLR; vendor 8192cd_hw.c
++ * also writes 0xffffffff at 0x39C).
++ */
++#define REG_BD_RWPTR_CLR		0x039C
++
++/* HCI DMA control (0x300) and pre-fetch control (0x3DB),
++ * vendor halmac_reg2.h 883/991.  Programming per Hal88XXGen.c
++ * 5404-5425 (IS_EXIST_RTL8197FEM): burst sizes, keep BIT15 set (the
++ * 8197F hardware default "RXTAG" RXBD ready-check mode) and BIT14
++ * (stop BCNQ DMA); 0x3DB bits 6/7 disable RX/TX pre-fetch.
++ */
++#define REG_HCI_CTRL			0x0300
++#define REG_HCI_CTRL2			0x03DB
++#define HCI_MAX_RXDMA_SHIFT		28	/* bits[30:28], 0=16B..7=2048B */
++#define HCI_MAX_RXDMA_MASK		GENMASK(30, 28)
++#define HCI_MAX_TXDMA_SHIFT		24	/* bits[26:24] */
++#define HCI_MAX_TXDMA_MASK		GENMASK(26, 24)
++#define HCI_BURST_SIZE_32B		1	/* LBUS burst: 32 bytes */
++#define HCI_STOP_BCNQ			BIT(14)
++#define HCI_RXTAG_MODE			BIT(15)	/* 1 = RXBD ready check by
++						 * HW RXTAG counter (8197F
++						 * power-on default)
++						 */
++#define HCI2_DIS_RXDMA_PRE		BIT(6)
++#define HCI2_DIS_TXDMA_PRE		BIT(7)
++
++/* Producer/consumer pointer registers: low 16 bits = host write
++ * (producer, we write with write16), high 16 bits = HW consumer
++ * (TX done / RX fill).  Vendor Hal88XXTxDesc.c 2476-2489
++ * GetTxQueueHWIdx88XX() reads bits[27:16] (HalComBit.h
++ * BIT_SHIFT_QUEUE_HW_IDX 16); mainline rtw88 pci.h TRX_BD_IDX_MASK /
++ * TRX_BD_HW_IDX_MASK.
++ */
++#define REG_VOQ_TXBD_IDX		0x03A0
++#define REG_VIQ_TXBD_IDX		0x03A4
++#define REG_BEQ_TXBD_IDX		0x03A8
++#define REG_BKQ_TXBD_IDX		0x03AC
++#define REG_MGQ_TXBD_IDX		0x03B0
++#define REG_RXQ_RXBD_IDX		0x03B4
++#define REG_HI0Q_TXBD_IDX		0x03B8
++#define REG_RRSR			0x0440	/* Response Rate Set */
++#define REG_ARFR1			0x044C	/* rate fall-back set 1, 64 bit */
++#define REG_HWSEQ_CTRL			0x0423
++#define REG_EDCA_VO_PARAM		0x0500
++#define REG_EDCA_VI_PARAM		0x0504
++#define REG_EDCA_BE_PARAM		0x0508
++#define REG_EDCA_BK_PARAM		0x050C
++#define REG_SLOT_TIME			0x051B	/* slot time in us (byte) */
++#define REG_TXPAUSE			0x0522
++/* TXREQ clear-disable gate (HalComReg.h 940): 0x80 = "Disable BT
++ * coextense" - without it the MAC believes the air interface is
++ * arbitrated away and never grants TXREQ (pages never drain).
++ */
++#define REG_DIS_TXREQ_CLR		0x0523
++/* Short[15:8] / long[7:0] retry limits (HalComReg.h 697); zero limits
++ * can keep the MAC from transmitting at all.  Vendor AP defaults
++ * (HalCfg.h 626-630, non-CONFIG_RTL8672): 0x10/0x10.
++ */
++#define REG_RETRY_LIMIT			0x042A
++#define RTL8192F_RETRY_LIMIT_DEFAULT	0x1010
++#define REG_BCN_CTRL			0x0550
++#define REG_MBID_NUM			0x0552
++/* Beacon registers on the 88XX map (halmac_reg2.h 1182/1571-1573):
++ * BCNQ_BDNY is 0x424, NOT the rtlwifi 8192ee 0x558.  0x554 is
++ * MBSSID_BCN_SPACE (TBTT period) and 0x558/0x559 are DRVERLYINT /
++ * BCNDMATIM (the vendor MAC_REG init table writes 0x559 = 2).
++ */
++#define REG_BCNQ_BDNY			0x0424
++#define REG_MBSSID_BCN_SPACE		0x0554
++#define REG_DRVERLYINT			0x0558
++#define REG_BCNDMATIM			0x0559
++#define REG_ATIMWND			0x055A	/* 16 bit (HalComReg.h 976) */
++#define REG_TBTT_PROHIBIT		0x0540	/* HalComReg.h 946 */
++#define REG_BCNTCFG			0x0510	/* HalComReg.h 931 */
++#define REG_PKT_LIFETIME_CTRL		0x0528	/* HalComReg.h 944 */
++/* Vendor HW_VAR_MAC_CONFIG, AP branch (Hal88XXGen.c 432/457-462/484-490):
++ * TBTT_PROHIBIT = 0x40004, DRVERLYINT = 10 (BEACON_ERALY_INIT_TIME),
++ * BCNDMATIM = 1, ATIMWND = 0x3C, BCNTCFG = 0x3213, and PKT_LIFETIME_CTRL
++ * bit19 cleared (`HAL_RTL_W32(REG_PKT_LIFETIME_CTRL, .. & ~BIT(19))`,
++ * :464; the bit is BIT_DIS_PKT_TX_ATIM, halmac_bit2.h REG_PKT_LIFETIME_CTRL).
++ */
++#define RTL8192F_TBTT_PROHIBIT_AP	0x00040004
++#define RTL8192F_BCNTCFG_AP		0x3213
++#define BIT_DIS_PKT_TX_ATIM		BIT(19)
++/* REG_BCN_CTRL bits (HalComBit.h 16406-16409).  The vendor AP value is
++ * DIS_TSF_UDT|EN_BCN_FUNCTION|EN_TXBCN_RPT|DIS_RX_BSSID_FIT = 0x5c, which
++ * is what the working vendor AP reads back at 0x550.
++ */
++#define BIT_BCN_DIS_TXBCN_RPT		BIT(2)
++#define BIT_BCN_EN_FUNCTION		BIT(3)
++#define BIT_BCN_DIS_TSF_UDT		BIT(4)
++#define BIT_BCN_DIS_RX_BSSID_FIT	BIT(6)
++#define REG_TCR				0x0604
++/* mactx updates DTIM count / group bit / moreData in the resident beacon
++ * (HalComBit.h 17559-17560, written by Hal88XXGen.c 5281).
++ */
++#define BIT_TCR_UPD_HGQMD		BIT(4)
++#define BIT_TCR_UPD_TIMIE		BIT(5)
++#define REG_RCR				0x0608
++/* Frame-type accept maps (HalComReg.h 1237-1239 + the MAC_V2 branch of
++ * Hal88XXGen.c 519-526): management 0x6A0, control 0x6A2, data 0x6A4.
++ * The vendor enables exactly PS-Poll (BIT_CTRLFLT10EN) in the control
++ * map; leaving it wide open DMAs ACK/CTS/Block-Ack frames into the RX
++ * ring as 14-32 byte junk descriptors.
++ */
++#define REG_RXFLTMAP0			0x06A0	/* management */
++#define REG_RXFLTMAP1			0x06A2	/* control */
++#define REG_RXFLTMAP2			0x06A4	/* data */
++#define BIT_RXFLT_PSPOLL		BIT(10)
++/* Byte registers at 0x60C-0x60F (HalComReg.h 1135-1137, halmac_reg2.h
++ * 1809-1811): RX_PKT_LIMIT 0x60C, RX_DLK_TIME 0x60D, and RX_DRVINFO_SZ
++ * 0x60F.  A wider write here spills into the neighbours - the previous
++ * 16-bit write to "0x60E" zeroed 0x60F and corrupted 0x60D.
++ */
++#define REG_RX_PKT_LIMIT		0x060C
++#define REG_RX_DLK_TIME			0x060D
++/* REG_RX_DRVINFO_SZ (0x60F): bits[3:0] = driver info size in 8-byte
++ * units appended to each RX packet, bit6 = APP_MH_SHIFT (payload
++ * 4-byte alignment), bit5 = WMAC_ENSHIFT (must stay clear, vendor
++ * InitMAC88XX() Hal88XXGen.c 4966-4973).  halmac_bit2.h
++ * 25923/25943/25986-25988, halmac_reg2.h 1811.
++ */
++#define REG_RX_DRVINFO_SZ		0x060F
++#define RX_DRVINFO_SZ_UNIT		4	/* 4 x 8B per RX packet */
++#define RX_DRVINFO_APP_MH_SHIFT	BIT(6)
++#define RX_DRVINFO_ENSHIFT		BIT(5)
++#define REG_MACID			0x0610	/* MACID[0] addr, 8B each */
++#define REG_BSSIDR			0x0618	/* BSSID, 6 bytes */
++
++/* MACID Setting area / BSSIDR / RRSR / SLOT_TIME provenance:
++ * vendor 8192c_reg.h (RTL8197_3411D_2 rtl8192cd).
++ */
++
++/* EDCA register value layout (Realtek gen-2): bits 31:16 TXOP limit in us,
++ * bits 15:8 ECWmax, bits 7:4 ECWmin, bits 3:0 AIFSN
++ */
++#define EDCA_VAL(aifs, ecwmin, ecwmax, txop) \
++	(((txop) << 16) | ((ecwmax) << 8) | ((ecwmin) << 4) | (aifs))
++
++/* SLOT_TIME (MAC 0x51B) values in us */
++#define RTL8192F_SLOT_SHORT	0x09
++#define RTL8192F_SLOT_LONG	0x14
++
++/* RCR bits (vendor WlanHAL/HalHeader/HalComBit.h 17611-17659, 88XX
++ * layout - NOT the gen-1 8192c_reg.h positions).
++ */
++#define RCR_AAP				BIT(0)
++#define RCR_APM				BIT(1)
++#define RCR_AM				BIT(2)
++#define RCR_AB				BIT(3)
++#define RCR_ACRC32			BIT(8)	/* pass FCS-error frames
++						 * (rtw88 FIF_FCSFAIL)
++						 */
++#define RCR_AICV			BIT(9)
++/* Accept management frames: gen-2 gates beacons/probe responses on this
++ * bit (the vendor sets 0x2000 in RCR).
++ */
++#define RCR_AMF				BIT(13)
++#define RCR_ADF				BIT(11)
++#define RCR_APP_PHYST_RXFF		BIT(28)
++#define RCR_APP_ICV			BIT(29)
++#define RCR_APP_MIC			BIT(30)
++#define RCR_APP_FCS			BIT(31)	/* keep the FCS in the
++						 * received frame
++						 */
++
++/* Default RX filter for all modes (hw_init, start, scan, assoc):
++ * accept unicast/multicast/broadcast, keep the FCS in the frame
++ * (the rx path trims it), append PHY status and crypto fields.
++ * ACRC32 matches the vendor 88XX baseline (Hal88XXGen.c 5248-5250,
++ * MAC-V2 which is what 8197F is): it lets FCS-bad frames reach the
++ * driver so the drop is visible and countable.  ADF must NOT be
++ * set: the vendor removes it deliberately ("setting BIT_ADF will
++ * also accept BA and BAR", Hal88XXGen.c 505-507) and on this core
++ * ADF stops beacon reception entirely.
++ */
++#define RTL8192F_RCR_DEFAULT		(RCR_AAP | RCR_APM | RCR_AM | \
++					 RCR_AB | RCR_AMF | RCR_ACRC32 | \
++					 RCR_APP_FCS | RCR_APP_MIC | \
++					 RCR_APP_ICV | RCR_APP_PHYST_RXFF)
++
++/* CR (0x0100) bits - vendor 8192c_reg.h 1087-1094 names, one set for
++ * the whole driver.
++ */
++#define CR_HCI_TXDMA_EN			BIT(0)	/* HCI to TXDMA interface */
++#define CR_HCI_RXDMA_EN			BIT(1)	/* HCI to RXDMA interface */
++#define CR_TXDMA_EN			BIT(2)	/* TXDMA function */
++#define CR_RXDMA_EN			BIT(3)	/* RXDMA function */
++#define CR_PROTOCOL_EN			BIT(4)	/* protocol block */
++#define CR_SCHEDULE_EN			BIT(5)	/* scheduler */
++#define CR_MACTXEN			BIT(6)	/* MAC transmitter */
++#define CR_MACRXEN			BIT(7)	/* MAC receiver */
++
++/*
++ * Interrupt mask bits, group 0 (REG_HIMR0 0xB0 / REG_HISR0 0xB4).
++ * Bit layout per vendor halmac_bit2.h 10864-10881 (8197F section):
++ * RXOK=0, RDU=1, VODOK=2, VIDOK=3, BEDOK=4, BKDOK=5, MGTDOK=6,
++ * HIGHDOK=7.  Shared by core.c (irq handler) and txrx.c (start/stop +
++ * per-ring DOK map).
++ */
++#define RTL8192F_HIMR_RXOK		BIT(0)	/* RX DMA OK */
++#define RTL8192F_HIMR_RDU		BIT(1)	/* RX descriptor unavailable */
++#define RTL8192F_HIMR_VODOK		BIT(2)
++#define RTL8192F_HIMR_VIDOK		BIT(3)
++#define RTL8192F_HIMR_BEDOK		BIT(4)
++#define RTL8192F_HIMR_BKDOK		BIT(5)
++#define RTL8192F_HIMR_MGTDOK		BIT(6)
++#define RTL8192F_HIMR_HIGHDOK		BIT(7)
++#define RTL8192F_HIMR_HISR1_IND		BIT(11)	/* HISR1 has latched bits */
++#define RTL8192F_HIMR_BCNDMAINT0	BIT(20)	/* beacon TXBD request */
++#define RTL8192F_HIMR_TXBCN0ERR		BIT(26)	/* beacon TX failed */
++#define RTL8192F_HIMR_TXBCN0OK		BIT(25)	/* beacon TX done */
++
++/* Group 1 (REG_HIMR1 0xB8 / REG_HISR1 0xBC), halmac_bit2.h 11147-11160:
++ * FIFO overflow indicators live here, not in group 0.
++ */
++#define RTL8192F_HIMR1_FOVW		BIT(8)	/* RX fifo overflow */
++#define RTL8192F_HIMR1_TXFOVW		BIT(9)	/* TX fifo overflow */
++#define RTL8192F_HIMR1_RXERR		BIT(10)	/* RX error (0x210 latch) */
++#define RTL8192F_HIMR1_TXERR		BIT(11)	/* TX error (0x210 latch) */
++
++/* TX queue done (DOK) bits the irq handler serves.  HIGHDOK is bit 7:
++ * group addressed frames go out on Q_HIGH and its ring is reaped by
++ * the same tx done path.
++ */
++#define RTL8192F_TX_DONE_MASK		(RTL8192F_HIMR_VODOK |	\
++					 RTL8192F_HIMR_VIDOK |	\
++					 RTL8192F_HIMR_BEDOK |	\
++					 RTL8192F_HIMR_BKDOK |	\
++					 RTL8192F_HIMR_MGTDOK |	\
++					 RTL8192F_HIMR_HIGHDOK)
++
++/* Host-owned HIMR0 set, vendor EnableIMR88XX/IntMask[0] (Hal88XXGen.c
++ * 5479: BIT_RXOK | BIT_HISR1_IND_INT | BIT_RDU, plus the AP-mode beacon
++ * bits at 5489-5491).  The per-queue DOK bits are NOT here on purpose:
++ * on this SoC the in-core MIPS scheduler consumes them, and the host
++ * enabling them - which write-clears them - silences the transmitter.
++ */
++#define RTL8192F_HIMR0_INT_MASK		(RTL8192F_HIMR_RXOK |	\
++					 RTL8192F_HIMR_RDU |	\
++					 RTL8192F_HIMR_HISR1_IND | \
++					 RTL8192F_HIMR_BCNDMAINT0 | \
++					 RTL8192F_HIMR_TXBCN0OK | \
++					 RTL8192F_HIMR_TXBCN0ERR)
++#define RTL8192F_HIMR1_INT_MASK		(RTL8192F_HIMR1_FOVW |	\
++					 RTL8192F_HIMR1_TXFOVW |	\
++					 RTL8192F_HIMR1_RXERR |	\
++					 RTL8192F_HIMR1_TXERR)
++
++/* TXDMA_STATUS error bits that carry the reason a frame was refused
++ * (see REG_TXDMA_STATUS above); masked against the raw read when the
++ * TX path takes its per-frame forensic snapshot.
++ */
++#define RTL8192F_TXDMA_ERR_MASK		0x0000f000
++
++/* SYS_ISO_CTRL bits (vendor 8192c_reg.h) */
++#define SYS_ISO_ANALOG_IPS		BIT(5)	/* PW_ISO_ANO_IPS: isolate
++						 * analog IPs from digital
++						 */
++#define SYS_ISO_PWC_EV12V		BIT(15)	/* 1.2V power from VDDON */
++
++/* SYS_FUNC_EN bits (vendor 8192c_reg.h; BIT13 DIO_RF per
++ * 8192cd_hw.c 8197F init block, "val16 | BIT(13) | BIT(0) | BIT(1)")
++ */
++#define SYS_FUNC_BBRSTB			BIT(0)
++#define SYS_FUNC_BB_GLB_RSTN		BIT(1)
++#define SYS_FUNC_CPU_EN			BIT(10)	/* MCU (+1 byte bit2) */
++#define SYS_FUNC_ELDR			BIT(12)	/* EFuse loader clock */
++#define SYS_FUNC_DIO_RF			BIT(13)	/* RF over DIO (8197F) */
++#define SYS_FUNC_MREGEN			BIT(15)
++
++/* APS_FSMCO bits (vendor 8192c_reg.h) */
++#define APS_FSMCO_MAC_ENABLE		BIT(8)	/* MAC_ON, self-clearing */
++#define APS_FSMCO_MAC_OFF		BIT(9)
++#define APS_FSMCO_SW_LPS		BIT(10)
++#define APS_FSMCO_HW_SUSPEND		BIT(11)
++#define APS_FSMCO_PCIE			BIT(12)
++#define APS_FSMCO_HW_POWERDOWN		BIT(15)
++#define APS_FSMCO_WLON_RESET		BIT(16)
++
++/* SYS_CLKR bits (vendor 8192c_reg.h) */
++#define SYS_CLK_ANA8M			BIT(1)
++#define SYS_CLK_LOADER_CLK_EN		BIT(5)	/* EFuse loader clock gate */
++#define SYS_CLK_MAC_CLK_ENABLE		BIT(11)
++
++/* REG_SYS_CLKR_88XX (0x70) bits, vendor HalComBit.h */
++#define SYS_CLKR88_AFE_PORT2_ISO		BIT(26)	/* isolates the TX path */
++
++/* AFE_MISC bits */
++#define AFE_MISC_WL_XTAL_CTRL		BIT(6)	/* WL XTAL control */
++#define AFE_MISC_SWB_TELDO		BIT(18)	/* SWR OCP enable (rtl8xxxu
++						 * 8192f.c)
++						 */
++
++/* RF_CTRL (0x1f) bits */
++#define RF_ENABLE			BIT(0)
++#define RF_RSTB				BIT(1)
++#define RF_SDMRSTB			BIT(2)
++
++/* ------------------------------------------------------------------ */
++/* Queue / ring layout - 88XX "new BD" dual-ring model                 */
++/*                                                                     */
++/* Every TX queue is a pair of rings: a TXBD ring of 32-byte buffer    */
++/* descriptors (4 x 8-byte elements, addresses live here, no OWN       */
++/* kick) plus a 40-byte TX info descriptor embedded in the payload     */
++/* buffer (mainline style, rtw88 pci.c rtw_pci_tx_write_data()).  Kick */
++/* and reclaim are done through the *_TXBD_IDX register producer /     */
++/* consumer indices.  The beacon queue is a resident single-slot BD    */
++/* gated by the BCN_OWN bit, not a host-advanced ring.                 */
++/* ------------------------------------------------------------------ */
++
++enum rtl8192f_queue {
++	Q_MGNT = 0,
++	Q_BK,
++	Q_BE,
++	Q_VI,
++	Q_VO,
++	Q_HIGH,		/* multicast / group addressed */
++	Q_BEACON,	/* single-slot BCNQ, no host idx ring */
++	Q_NUM
++};
++
++/*
++ * Hardware queue select values for the TX info descriptor W1 QSEL
++ * field (88XX encoding, vendor Hal88XXTxDesc.c queue mapping; mainline
++ * rtw88 tx.h 56-77 enum rtw_tx_desc_queue_select).  Data AC frames use
++ * the TID from the skb (0..15) directly.
++ */
++#define RTL8192F_QSEL_BEACON		16
++#define RTL8192F_QSEL_HIGH		17
++#define RTL8192F_QSEL_MGMT		18
++
++/* Geometry :
++ * TXBD element 8B x 4 = 32B (HalCfg.h TXBD_SEG_32_64_SEL=0 +
++ * TXBD_ELE_NUM=4, Hal88XXTxDesc.h 88-101), TX info desc 40B
++ * (SIZE_TXDESC_88XX, Hal88XXTxDesc.h 20-23; the 8197F uses 40, not
++ * the V1 48), RXBD 8B (halmac_rx_bd_nic.h), RX info desc 24B at the
++ * start of the DMA buffer (SIZE_RXDESC_88XX, Hal88XXRxDesc.h 20).
++ */
++#define RTL8192F_TXBD_ELE_NUM		4
++#define RTL8192F_TXBD_ELE_SIZE		8
++#define RTL8192F_TXBD_SIZE		(RTL8192F_TXBD_ELE_NUM * \
++					 RTL8192F_TXBD_ELE_SIZE)
++#define RTL8192F_TX_INFO_DESC_SIZE	40
++#define RTL8192F_RXBD_SIZE		8
++#define RTL8192F_RX_INFO_DESC_SIZE	24
++
++#define RTL8192F_NUM_TX_DESC		128
++#define RTL8192F_NUM_RX_DESC		128
++#define RTL8192F_RX_BUF_SIZE		8192
++
++/* PSB page size: pages of 256B on the 8197F (HalCfg.h PBP_PSTX_SIZE
++ * 256 for the 92E/8881A/8197F series; NOT the 128 of PCIe parts that
++ * rtw88 uses).  PSB = ceil((40 + frame len) / 256),
++ * Hal88XXTxDesc.c 1653-1669.
++ */
++#define RTL8192F_TX_PAGE_SIZE		256
++
++/* Beacon: resident single slot per VIF at a fixed 128-byte stride in
++ * the BCNQ TXBD area ("HW Fixed value", HalCfg.h TXBD_BEACON_OFFSET_V1
++ * = 128 for the 8197F).  One slot for the single supported VIF; MBSSID
++ * slots would follow at +128B each.
++ */
++#define RTL8192F_BCN_SLOT_STRIDE	128
++#define RTL8192F_NUM_BCN_SLOT		1
++/* Beacon payload buffer: 2.4 GHz beacon (24B header + fixed IEs + vendor/RSN
++ * IEs + TIM) stays well under this; an oversized template is dropped with a
++ * warning rather than corrupting the resident slot.
++ */
++#define RTL8192F_BEACON_MAX_LEN		1024
++
++/* TXBD element: DW0 = TX_BUFF_SIZE0[15:0] + PSB[23:16] (beacon variant
++ * bits[30:16] = PSLEN, bit31 = BCN_OWN), DW1 = DMA low 32.
++ * halmac_tx_bd_nic.h 15-20; mainline rtw88 pci.h
++ * struct rtw_pci_tx_buffer_desc.
++ */
++struct rtl8192f_txbd_ele {
++	__le16	buf_size;
++	__le16	psb_len;
++	__le32	dma;
++} __packed;
++
++/* TXBD: 4 elements x 8B = 32B.  The full 4-segment layout is kept so
++ * hardware-encryption gather segments (ELE[2]/ELE[3]) can be added
++ * later without moving the ring .
++ */
++struct rtl8192f_txbd {
++	struct rtl8192f_txbd_ele ele[RTL8192F_TXBD_ELE_NUM];
++} __packed;
++
++/* RXBD element: DW0 = RXBUFFSIZE[13:0] + LS[14] + FS[15] +
++ * TOTALRXPKTSIZE[28:16] + RXFAIL[31], DW1 = DMA low 32.
++ * halmac_rx_bd_nic.h 7-13; mainline rtw88 pci.h
++ * struct rtw_pci_rx_buffer_desc.  There is no OWN bit; a filled entry
++ * is recognised by TOTALRXPKTSIZE != tag.
++ */
++struct rtl8192f_rxbd {
++	__le16	buf_size;
++	__le16	total_pkt_size;
++	__le32	dma;
++} __packed;
++
++struct rtl8192f_tx_ring {
++	struct rtl8192f_txbd	*bd;	/* coherent TXBD array, 32B/entry */
++	dma_addr_t		bd_dma;
++	struct rtl8192f_tx_desc_info *info;
++	u32	head;		/* next TXBD to fill (host producer) */
++	u32	tail;		/* next TXBD to reap (HW consumer) */
++	u8	qsel;		/* fixed qsel (mgmt/high), 0 = per-skb TID */
++	const char *name;
++};
++
++/* Number of hardware MACIDs (peer slots).  MACID 0 is the client-mode
++ * default and never handed out by rtl8192f_alloc_macid().
++ */
++#define RTL8192F_NUM_MACID		32
++
++/* Per-peer driver state (hw->sta_data_size): the MACID slot this peer's
++ * frames carry, which is also the rate-adaptation entry the firmware was
++ * given for it.  It cannot live in priv: with one slot there, a second
++ * client overwrote it and the first client's teardown failed its "is this
++ * my station" test, leaking the MACID.
++ */
++struct rtl8192f_sta {
++	u8 macid;
++};
++
++/* Beacon single slot: one TXBD (128B stride area) + one 40B TX info
++ * descriptor + the beacon payload, all coherent, allocated once at probe.
++ *
++ * The payload buffer is stable and permanently DMA-mapped: the hardware
++ * re-reads it at every TBTT, so a content change is just a memcpy plus the
++ * BSS_CHANGED_BEACON notification mac80211 sends whenever hostapd renews the
++ * template (net/mac80211/cfg.c:1480 ieee80211_assign_beacon).  Re-mapping a
++ * fresh skb per period was both a use-after-free window (the previous buffer
++ * was freed while an in-flight fetch could still read it) and a race against
++ * the TBTT.
++ *
++ * It was introduced because a one-shot upload appeared to leave a stale
++ * template on air; the hardware counter says the schedule was never the
++ * problem (HISR0 TXBCN0OK runs at 10.0/s with TXBCN0ERR 0 before
++ * and after an interface restart), so what this change buys is the
++ * removal of the free-while-DMA-may-still-fetch window and of a 10 Hz work
++ * item - not a beacon-rate fix.
++ */
++struct rtl8192f_bcn_slot {
++	struct rtl8192f_txbd	*bd;	/* inside the BCNQ TXBD area */
++	dma_addr_t		bd_dma;
++	void			*txdesc;	/* 40B TX info desc */
++	dma_addr_t		txdesc_dma;
++	void			*frame;		/* RTL8192F_BEACON_MAX_LEN payload */
++	dma_addr_t		frame_dma;
++	u32			frame_len;	/* bytes currently armed */
++};
++
++struct rtl8192f_rx_ring {
++	struct rtl8192f_rxbd	*bd;
++	dma_addr_t		bd_dma;	struct rtl8192f_rx_desc_info *info;
++	u32	wp;		/* next RXBD to fill (host producer) */
++	u32	rp;		/* next RXBD to process */
++	/* Expected HW RXTAG counter value (RXBD_READY_CHECK_METHOD: the
++	 * hardware stamps every RXBD it fills with a rolling 13-bit tag;
++	 * a slot is ready when its TOTALRXPKTSIZE field equals this,
++	 * vendor Hal88XXRxDesc.c 482-542).
++	 */
++	u16	rxtag;
++};
++
++struct rtl8192f_tx_desc_info {
++	struct sk_buff *skb;
++	DEFINE_DMA_UNMAP_ADDR(dma);
++	DEFINE_DMA_UNMAP_LEN(len);
++	u8	rate;		/* descriptor TX_RATE encoding, for the
++				 * mac80211 rate-control report
++				 */
++	bool	sgi;		/* W5 DATA_SHORT on an HT rate: short GI */
++};
++
++struct rtl8192f_rx_desc_info {
++	struct sk_buff *skb;
++	DEFINE_DMA_UNMAP_ADDR(dma);
++};
++
++/* ------------------------------------------------------------------ */
++/* Init table entry formats (ported from vendor PHYDM halhwimg files)  */
++/* ------------------------------------------------------------------ */
++
++struct rtl8192f_reg32val {
++	u16 addr;
++	u32 val;
++};
++
++struct rtl8192f_reg8val {
++	u16 addr;
++	u8 val;
++};
++
++struct rtl8192f_rfregval {
++	u8 addr;
++	u32 val;
++};
++
++/* Init tables (exported by tables_*.c).  The vendor arrays carry no
++ * zero-address terminator (first MAC row is {0x000, 0x92}, last RadioA
++ * row is {0x00, 0x35df5}), so consumers iterate over these explicit
++ * lengths .
++ */
++#define RTL8192F_MAC_TABLE_LEN		144
++#define RTL8192F_PHY_TABLE_LEN		464
++#define RTL8192F_AGC_TABLE_LEN		132
++#define RTL8192F_RF_TABLE_LEN		72
++
++extern const struct rtl8192f_reg8val rtl8192f_soc_mac_init_table[RTL8192F_MAC_TABLE_LEN];
++extern const struct rtl8192f_reg32val rtl8192f_soc_phy_init_table[RTL8192F_PHY_TABLE_LEN];
++extern const struct rtl8192f_reg32val rtl8192f_soc_agc_table[RTL8192F_AGC_TABLE_LEN];
++extern const struct rtl8192f_rfregval rtl8192f_soc_radioa_table[RTL8192F_RF_TABLE_LEN];
++
++/* ------------------------------------------------------------------ */
++/* Private state                                                       */
++/* ------------------------------------------------------------------ */
++
++struct rtl8192f_soc_priv {
++	struct ieee80211_hw *hw;
++	struct platform_device *pdev;
++	void __iomem *regs;
++	int irq;
++
++	/* SoC-side WiFi clocks: the WLAN clock/function gate and the
++	 * crystal reference behind the core's REF_SEL choice.
++	 */
++	struct clk *clk_core;
++	struct clk *clk_ref;
++
++	spinlock_t irq_lock;	/* HISR ack / ring indices */
++	struct mutex conf_mutex;
++
++	/* Host -> core firmware command mailbox (H2C): which box is next
++	 * and a lock so two senders cannot interleave inside one box.
++	 * Sleepable: the sender waits for the firmware to empty the box.
++	 */
++	struct mutex h2c_mutex;
++	u8 h2c_box;
++
++	struct rtl8192f_tx_ring tx_ring[Q_NUM];
++	struct rtl8192f_rx_ring rx_ring;
++	bool fw_ready;	/* core MIPS firmware loaded and running */
++	struct rtl8192f_bcn_slot bcn;
++
++	/* RX DMA buffer processing runs in a tasklet; the hard IRQ only
++	 * advances the HW write pointer check and schedules it.  NAPI is
++	 * the long-term direction, TODO.
++	 */
++	struct tasklet_struct rx_tasklet;
++
++	bool hw_ready;
++	bool running;
++	u32 cur_channel;
++	enum nl80211_channel_type cur_chan_type;
++
++	/* interface state (single-vif for now) */
++	struct ieee80211_vif *vif;
++	bool scanning;
++	DECLARE_BITMAP(macid_map, RTL8192F_NUM_MACID);
++
++	/* Firmware-to-host messages, counted where they are dropped (see
++	 * rtl8192f_c2h_handle).  Nothing decodes them: the one per-peer TX
++	 * totals message this family has (C2H id 4) only exists as the answer
++	 * to H2C AP_REQ_TXREP (0x43), which is not requested here (fw.c, note
++	 * above h2c_cmd_taken), so there is no aggregate to store.
++	 * c2h_first_id/len record what did arrive, if anything.
++	 */
++	unsigned long c2h_cnt;
++	u8 c2h_first_id;
++	u32 c2h_first_len;
++
++	u8 mac_addr[ETH_ALEN];
++	u8 cut_version;	/* SYS_CFG[15:12], vendor ODM_CMNINFO_CUT_VER */
++
++	/* flags reported to mac80211 by configure_filter() */
++	u32 filter_flags;
++
++	/* EFuse decoded logical map.  512 bytes: the gen-2.5 logical map
++	 * is 64 sections x 4 word units x 2 bytes = 512 .
++	 * Vendor 8192cd_hw.c ReadEFuse(): priv->EfuseMapLen.
++	 */
++	u8 efuse_map[512];
++
++};
++
++/* ------------------------------------------------------------------ */
++/* I/O helpers                                                         */
++/* ------------------------------------------------------------------ */
++
++static inline u32 rtl8192f_read32(struct rtl8192f_soc_priv *priv, u16 addr)
++{
++	return readl(priv->regs + addr);
++}
++
++static inline void rtl8192f_write32(struct rtl8192f_soc_priv *priv,
++				    u16 addr, u32 val)
++{
++	writel(val, priv->regs + addr);
++}
++
++static inline u8 rtl8192f_read8(struct rtl8192f_soc_priv *priv, u16 addr)
++{
++	return readb(priv->regs + addr);
++}
++
++static inline void rtl8192f_write8(struct rtl8192f_soc_priv *priv,
++				   u16 addr, u8 val)
++{
++	writeb(val, priv->regs + addr);
++}
++
++static inline u16 rtl8192f_read16(struct rtl8192f_soc_priv *priv, u16 addr)
++{
++	return readw(priv->regs + addr);
++}
++
++static inline void rtl8192f_write16(struct rtl8192f_soc_priv *priv,
++				    u16 addr, u16 val)
++{
++	writew(val, priv->regs + addr);
++}
++
++static inline void rtl8192f_setbits32(struct rtl8192f_soc_priv *priv,
++				      u16 addr, u32 mask)
++{
++	rtl8192f_write32(priv, addr, rtl8192f_read32(priv, addr) | mask);
++}
++
++static inline void rtl8192f_clrbits32(struct rtl8192f_soc_priv *priv,
++				      u16 addr, u32 mask)
++{
++	rtl8192f_write32(priv, addr, rtl8192f_read32(priv, addr) & ~mask);
++}
++
++/* BB/PHY access: BB registers live at 0x800+ (via MAC PHY IF), RF via
++ * HSSI read/write registers.  Standard Realtek gen-2 indirect layout.
++ */
++#define RTL8192F_BB_BASE		0x0800
++#define RTL8192F_HSSI_R1		0x0840	/* rFPGA0_XA_HSSI_PARM1 */
++#define RTL8192F_HSSI_R2		0x0844	/* rFPGA0_XA_HSSI_PARM2 */
++#define RTL8192F_HSSI_READ_TRIGGER	BIT(8)
++
++void rtl8192f_phy_set_rf_reg(struct rtl8192f_soc_priv *priv, u8 addr, u32 val);
++u32 rtl8192f_phy_get_rf_reg(struct rtl8192f_soc_priv *priv, u8 addr);
++void rtl8192f_write_bb_reg(struct rtl8192f_soc_priv *priv, u16 addr, u32 val);
++u32 rtl8192f_read_bb_reg(struct rtl8192f_soc_priv *priv, u16 addr);
++
++/* RF register masks */
++#define RFREG_MASK			0xfffff
++
++/* ------------------------------------------------------------------ */
++/* SoC-side WiFi clocks                                                */
++/*                                                                     */
++/* The core MMIO window (priv->regs) is only reachable after the       */
++/* SoC-side WLAN clock/function gate is opened, and its analog front   */
++/* end has to be told which crystal it is fed.  Both are provided by   */
++/* the system-controller clock driver: "core" is the gate (vendor      */
++/* 8192cd_osdep.c sets 0xB8000064 |= 0x1F on and = 0x00 off, and       */
++/* 8192cd_util.h treats bit0 as "may access WiFi registers"), "ref"    */
++/* carries the 25/40 MHz strap so REF_SEL can be derived from it.      */
++/* ------------------------------------------------------------------ */
++
++int rtl8192f_wlan_clk_enable(struct rtl8192f_soc_priv *priv);
++void rtl8192f_wlan_clk_disable(struct rtl8192f_soc_priv *priv);
++
++/* ------------------------------------------------------------------ */
++/* EFuse geometry (gen-2.5)                                            */
++/* vendor rtl8192cd_hw.c ReadEFuse(): the physical EFuse content is a  */
++/* stream of PG packets (1 or 2 byte header + up to 4 word-pairs);     */
++/* packets are decoded into a logical byte map where section i / word  */
++/* j lands at map[(i << 3) + (j << 1)].                                */
++/* ------------------------------------------------------------------ */
++
++#define EFUSE_MAX_WORD_UNIT	4
++#define EFUSE_MAX_SECTION	64
++#define EFUSE_REAL_CONTENT_LEN	512	/* physical efuse bytes */
++#define EFUSE_MAP_LEN		512	/* logical map bytes */
++
++/* MAC address inside the decoded logical map.  The vendor has no 8197F
++ * branch for it (8192cd_eeprom.c:509 uses 0x2A for the crystal cap), so
++ * a board whose efuse holds no MAC address falls back to a random
++ * locally administered one rather than failing probe.
++ */
++#define EFUSE_MAP_MAC_OFFSET	0x2a
++
++/* ------------------------------------------------------------------ */
++/* core.c                                                              */
++/* ------------------------------------------------------------------ */
++
++irqreturn_t rtl8192f_interrupt(int irq, void *dev_id);
++int rtl8192f_add_interface(struct ieee80211_hw *hw,
++			   struct ieee80211_vif *vif);
++void rtl8192f_remove_interface(struct ieee80211_hw *hw,
++			       struct ieee80211_vif *vif);
++int rtl8192f_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		       struct ieee80211_sta *sta,
++		       enum ieee80211_sta_state old_state,
++		       enum ieee80211_sta_state new_state);
++int rtl8192f_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		     unsigned int link_id, u16 queue,
++		     const struct ieee80211_tx_queue_params *params);
++void rtl8192f_sw_scan_start(struct ieee80211_hw *hw,
++			    struct ieee80211_vif *vif, const u8 *mac_addr);
++void rtl8192f_sw_scan_complete(struct ieee80211_hw *hw,
++			       struct ieee80211_vif *vif);
++int rtl8192f_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
++		     struct ieee80211_vif *vif, struct ieee80211_sta *sta,
++		     struct ieee80211_key_conf *key);
++void rtl8192f_bss_info_changed(struct ieee80211_hw *hw,
++			       struct ieee80211_vif *vif,
++			       struct ieee80211_bss_conf *info,
++			       u64 changed);
++
++/* ------------------------------------------------------------------ */
++/* hw.c - power, init, channel, efuse                                  */
++/* ------------------------------------------------------------------ */
++
++/* rtl8192f_beacon_upload moved to txrx.c (88XX beacon single slot).
++ * The core MIPS CPU firmware download lives in fw.c (vendor
++ * InitMIPSFirmware88XX): TXBD/BCN path + on-chip DDMA into IMEM/DMEM.
++ * Without it the core CPU never leaves reset and the TX drain stalls
++ * with FIFO pages never returned.
++ */
++
++int rtl8192f_hw_power_on(struct rtl8192f_soc_priv *priv);
++int rtl8192f_hw_init(struct rtl8192f_soc_priv *priv);
++int rtl8192f_hw_fifo_init(struct rtl8192f_soc_priv *priv);
++int rtl8192f_fw_download(struct rtl8192f_soc_priv *priv);
++int rtl8192f_h2c_send(struct rtl8192f_soc_priv *priv, u8 id,
++		      const u8 *payload, u8 len);
++void rtl8192f_c2h_handle(struct rtl8192f_soc_priv *priv, const u8 *pkt,
++			 u32 len);
++void rtl8192f_send_ra_mask(struct rtl8192f_soc_priv *priv, u8 macid,
++			   const struct ieee80211_sta *sta);
++u8 rtl8192f_ra_rate_id(const struct ieee80211_sta *sta);
++void rtl8192f_hw_power_off(struct rtl8192f_soc_priv *priv);
++int rtl8192f_set_channel(struct rtl8192f_soc_priv *priv, u32 channel);
++int rtl8192f_efuse_read(struct rtl8192f_soc_priv *priv);
++int rtl8192f_efuse_get_macaddr(struct rtl8192f_soc_priv *priv);
++
++/* ------------------------------------------------------------------ */
++/* rate.c - rate helpers                                               */
++/* ------------------------------------------------------------------ */
++
++void rtl8192f_tx_fill_rate(struct rtl8192f_soc_priv *priv, __le32 *desc,
++			   struct ieee80211_tx_info *info,
++			   struct ieee80211_sta *sta);
++/* desc points at the 24-byte 88XX RX info descriptor at the start of
++ * the RX DMA buffer, phy_status at the appended PHY status right after
++ * it (both interpreted per the 88XX layout, see rate.c).
++ */
++void rtl8192f_rx_fill_status(struct rtl8192f_soc_priv *priv, __le32 *desc,
++			     void *phy_status,
++			     struct ieee80211_rx_status *status);
++u32 rtl8192f_legacy_rate_to_hw(int idx, bool cck);
++u8 rtl8192f_mcs_to_hw(u8 mcs);
++int rtl8192f_alloc_macid(struct rtl8192f_soc_priv *priv);
++void rtl8192f_free_macid(struct rtl8192f_soc_priv *priv, u8 macid);
++
++/* ------------------------------------------------------------------ */
++/* txrx.c - descriptor rings, xmit, rx reclaim                         */
++/* ------------------------------------------------------------------ */
++
++int rtl8192f_txrx_alloc(struct rtl8192f_soc_priv *priv);
++void rtl8192f_txrx_free(struct rtl8192f_soc_priv *priv);
++int rtl8192f_txrx_start(struct rtl8192f_soc_priv *priv);
++void rtl8192f_txrx_stop(struct rtl8192f_soc_priv *priv);
++netdev_tx_t rtl8192f_tx(struct ieee80211_hw *hw, struct sk_buff *skb,
++			struct ieee80211_sta *sta);
++void rtl8192f_tx_isr(struct rtl8192f_soc_priv *priv);
++void rtl8192f_rx_isr(struct rtl8192f_soc_priv *priv);
++void rtl8192f_beacon_upload(struct rtl8192f_soc_priv *priv,
++			    struct sk_buff *skb);
++
++/* ------------------------------------------------------------------ */
++/* calib.c - IQK / calibration                                         */
++/* ------------------------------------------------------------------ */
++
++void rtl8192f_iqk(struct rtl8192f_soc_priv *priv);
++
++#endif /* __RTL8192F_SOC_H */
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/tables_bb.c
+@@ -0,0 +1,635 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * RTL8197F (RTL8192F-SoC) init tables, ported row-by-row from the
++ * vendor PHYDM image files (rtl8192cd/phydm/rtl8197f/, MP image v37):
++ *   halhwimg8197f_mac.c  Array_MP_8197F_MAC_REG
++ *   halhwimg8197f_bb.c   Array_MP_8197F_AGC_TAB / Array_MP_8197F_PHY_REG
++ *   halhwimg8197f_rf.c   Array_MP_8197F_RadioA
++ *
++ * The vendor arrays are PHYDM conditional-lookup format: rows whose
++ * address has bit31 set are IF/ELSE/ENDIF condition markers and rows
++ * with bit30 set are negative-condition evaluators (they select the
++ * board package / cut variant).  For the RTL8197F SoC target (package
++ * type 0, cut A, internal PA - CheckPositive() never matches) the
++ * vendor apply loops end up taking the ELSE branch of every block, so
++ * the rows below are exactly the ELSE-branch content in original table
++ * order.  Rows with address 0xffe (RF table) are the vendor 50 ms
++ * settling-delay markers (phydm_regconfig8197f.c
++ * odm_ConfigRFReg_8197F()); the apply code turns them into delays.
++ */
++#include "rtl8192f_soc.h"
++
++/* PHY_REG: 32-bit BB register writes, original table order. */
++const struct rtl8192f_reg32val rtl8192f_soc_phy_init_table[] = {
++	{ 0x800, 0x83005308 },
++	{ 0x804, 0x00004001 },
++	{ 0x808, 0x0000fc00 },
++	{ 0x80c, 0x00000000 },
++	{ 0x810, 0x20200322 },
++	{ 0x814, 0x020c3d10 },
++	{ 0x818, 0x00000385 },
++	{ 0x81c, 0x07000000 },
++	{ 0x820, 0x01000100 },
++	{ 0x824, 0x00390204 },
++	{ 0x828, 0x01000100 },
++	{ 0x82c, 0x00390204 },
++	{ 0x830, 0x00000000 },
++	{ 0x834, 0x00690200 },
++	{ 0x838, 0x00000004 },
++	{ 0x83c, 0x00690200 },
++	{ 0x840, 0x00010000 },
++	{ 0x844, 0x00010000 },
++	{ 0x848, 0x00000000 },
++	{ 0x84c, 0x00000000 },
++	{ 0x850, 0x00031fe0 },
++	{ 0x854, 0x00000000 },
++	{ 0x858, 0x569a569a },
++	{ 0x85c, 0x00400040 },
++	{ 0x860, 0x66f60000 },
++	{ 0x864, 0x061f0000 },
++	{ 0x868, 0x0f7f0130 },
++	{ 0x86c, 0x0f7f0130 },
++	{ 0x870, 0x00000300 },
++	{ 0x874, 0x04003400 },
++	{ 0x878, 0x08080808 },
++	{ 0x87c, 0x004f0201 },
++	{ 0x880, 0xd8001402 },
++	{ 0x884, 0xc0000120 },
++	{ 0x888, 0x00000000 },
++	{ 0x88c, 0xcc0000c0 },
++	{ 0x890, 0x00000000 },
++	{ 0x894, 0xfffffffe },
++	{ 0x898, 0x40302010 },
++	{ 0x89c, 0x00706050 },
++	{ 0x8a0, 0x00000000 },
++	{ 0x8a4, 0x00000000 },
++	{ 0x8a8, 0x00000109 },
++	{ 0x8ac, 0x00000000 },
++	{ 0x8b0, 0x00000000 },
++	{ 0x8b4, 0x00000000 },
++	{ 0x8b8, 0x00000000 },
++	{ 0x8bc, 0x00000000 },
++	{ 0x8c0, 0x03910c40 },
++	{ 0x8c4, 0x00000000 },
++	{ 0x8c8, 0x00000000 },
++	{ 0x8cc, 0x00000000 },
++	{ 0x8d0, 0x00000000 },
++	{ 0x8d4, 0x00000000 },
++	{ 0x8d8, 0x00000000 },
++	{ 0x8dc, 0x00000000 },
++	{ 0x8e0, 0x02000200 },
++	{ 0x8e4, 0x00000000 },
++	{ 0x8e8, 0xd8080000 },
++	{ 0x8ec, 0x00000000 },
++	{ 0x900, 0x00000000 },
++	{ 0x904, 0x00000023 },
++	{ 0x908, 0x00000f00 },
++	{ 0x90c, 0x81121313 },
++	{ 0x910, 0x024c0000 },
++	{ 0x914, 0x00000000 },
++	{ 0x918, 0x00000000 },
++	{ 0x91c, 0x00000000 },
++	{ 0x920, 0x00000000 },
++	{ 0x924, 0x00000000 },
++	{ 0x928, 0x00000000 },
++	{ 0x92c, 0x00000000 },
++	{ 0x930, 0x88000000 },
++	{ 0x934, 0x00000245 },
++	{ 0x938, 0x00024588 },
++	{ 0x93c, 0x00000000 },
++	{ 0x940, 0x000007ff },
++	{ 0x944, 0x3f3f0000 },
++	{ 0x948, 0x000001a3 },
++	{ 0x94c, 0x20200008 },
++	{ 0x950, 0x00338797 },
++	{ 0x954, 0x00000000 },
++	{ 0x958, 0x4bc7d87a },
++	{ 0x95c, 0x06eb9b79 },
++	{ 0x960, 0x00000000 },
++	{ 0x964, 0x00000000 },
++	{ 0x968, 0x00000000 },
++	{ 0x96c, 0x00000003 },
++	{ 0x970, 0x00000000 },
++	{ 0x974, 0x00000000 },
++	{ 0x978, 0x00000000 },
++	{ 0x97c, 0x10030000 },
++	{ 0x980, 0x00000000 },
++	{ 0x984, 0x00050050 },
++	{ 0x988, 0x000a5704 },
++	{ 0x98c, 0x1461c826 },
++	{ 0x990, 0x0001469e },
++	{ 0x994, 0x008858d1 },
++	{ 0x998, 0x700494c9 },
++	{ 0x99c, 0x77777777 },
++	{ 0x9a0, 0x00000000 },
++	{ 0x9a4, 0x00000000 },
++	{ 0x9a8, 0x00000000 },
++	{ 0x9ac, 0x00020000 },
++	{ 0x9b0, 0x00000000 },
++	{ 0x9b4, 0x00000000 },
++	{ 0x9b8, 0x00000000 },
++	{ 0x9bc, 0x00000000 },
++	{ 0x9c0, 0x00000011 },
++	{ 0x9c4, 0x00000000 },
++	{ 0x9c8, 0x00000000 },
++	{ 0x9cc, 0x00000000 },
++	{ 0x9d0, 0x00000000 },
++	{ 0x9d4, 0x00000000 },
++	{ 0x9d8, 0x00000000 },
++	{ 0x9dc, 0x00000000 },
++	{ 0x9e0, 0x00000000 },
++	{ 0x9e4, 0x00000000 },
++	{ 0x9e8, 0x00000000 },
++	{ 0x9ec, 0x00000000 },
++	{ 0x9f0, 0x80000000 },
++	{ 0x9f4, 0x00000000 },
++	{ 0x9f8, 0x00000000 },
++	{ 0xa00, 0x00d046c8 },
++	{ 0xa04, 0x80ff800c },
++	{ 0xa08, 0x9c838300 },
++	{ 0xa0c, 0x297e000f },
++	{ 0xa10, 0x9500bb78 },
++	{ 0xa14, 0x1114d028 },
++	{ 0xa18, 0x00881117 },
++	{ 0xa1c, 0x89140f00 },
++	{ 0xa20, 0xe82c0001 },
++	{ 0xa24, 0x64b80c1c },
++	{ 0xa28, 0x00008810 },
++	{ 0xa2c, 0x00920000 },
++	{ 0xa70, 0x101fbf00 },
++	{ 0xa74, 0x00000107 },
++	{ 0xa78, 0x00008900 },
++	{ 0xa7c, 0x225b0606 },
++	{ 0xa80, 0x21807532 },
++	{ 0xa84, 0x00110000 },
++	{ 0xa88, 0x040c0000 },
++	{ 0xa8c, 0x12345678 },
++	{ 0xa90, 0xabcdef00 },
++	{ 0xa94, 0x001b1b89 },
++	{ 0xa98, 0x00000000 },
++	{ 0xa9c, 0x3f000000 },
++	{ 0xaa0, 0x00000000 },
++	{ 0xaa4, 0x00010000 },
++	{ 0xaa8, 0xeaef0004 },
++	{ 0xaac, 0x01235667 },
++	{ 0xab0, 0x00000000 },
++	{ 0xab4, 0x00201402 },
++	{ 0xabc, 0xd2e2f2fa },
++	{ 0xb00, 0x00000000 },
++	{ 0xb04, 0x00000000 },
++	{ 0xb08, 0x00000000 },
++	{ 0xb0c, 0x00000000 },
++	{ 0xb10, 0x00000000 },
++	{ 0xb14, 0x00000000 },
++	{ 0xb18, 0x00000000 },
++	{ 0xb1c, 0x00000000 },
++	{ 0xb20, 0x00000000 },
++	{ 0xb24, 0x00000000 },
++	{ 0xb28, 0x00000000 },
++	{ 0xb2c, 0x00000000 },
++	{ 0xb30, 0x00000000 },
++	{ 0xb34, 0x00000000 },
++	{ 0xb38, 0x00000000 },
++	{ 0xb3c, 0x00000000 },
++	{ 0xb40, 0x00000000 },
++	{ 0xb44, 0x00000000 },
++	{ 0xb48, 0x00000000 },
++	{ 0xb4c, 0x00000000 },
++	{ 0xb50, 0x00000000 },
++	{ 0xb54, 0x00000000 },
++	{ 0xb58, 0x00000000 },
++	{ 0xb5c, 0x00000000 },
++	{ 0xb60, 0x00000000 },
++	{ 0xb64, 0x00000000 },
++	{ 0xb68, 0x80000000 },
++	{ 0xb6c, 0x80000000 },
++	{ 0xb70, 0x00000000 },
++	{ 0xb74, 0x00000000 },
++	{ 0xb78, 0x00000000 },
++	{ 0xb7c, 0x00000000 },
++	{ 0xb80, 0x00000000 },
++	{ 0xb84, 0x00000000 },
++	{ 0xb88, 0x00000000 },
++	{ 0xb8c, 0x00000000 },
++	{ 0xb90, 0x00000000 },
++	{ 0xb94, 0x00000000 },
++	{ 0xb98, 0x00000000 },
++	{ 0xb9c, 0x00000000 },
++	{ 0xba0, 0x00000000 },
++	{ 0xba4, 0x00000000 },
++	{ 0xba8, 0x00000000 },
++	{ 0xbac, 0x00000000 },
++	{ 0xbb0, 0x00440000 },
++	{ 0xbb4, 0x00000000 },
++	{ 0xbb8, 0x00000000 },
++	{ 0xbbc, 0x00000000 },
++	{ 0xbd0, 0x00000000 },
++	{ 0xbd4, 0x00000000 },
++	{ 0xbdc, 0x02000000 },
++	{ 0xbe0, 0x02000000 },
++	{ 0xbe4, 0x02000000 },
++	{ 0xbe8, 0x02000000 },
++	{ 0xbec, 0x02000000 },
++	{ 0xbf0, 0x02000000 },
++	{ 0xbf4, 0x02000000 },
++	{ 0xbf8, 0x02000000 },
++	{ 0xc00, 0x00000080 },
++	{ 0xc04, 0x6f005433 },
++	{ 0xc08, 0x000004e4 },
++	{ 0xc0c, 0x6c6c6c6c },
++	{ 0xc10, 0x22000000 },
++	{ 0xc14, 0x40000100 },
++	{ 0xc18, 0x22000000 },
++	{ 0xc1c, 0x40000100 },
++	{ 0xc20, 0x00000000 },
++	{ 0xc24, 0x40000100 },
++	{ 0xc28, 0x00000000 },
++	{ 0xc2c, 0x40000100 },
++	{ 0xc30, 0x0401a807 },
++	{ 0xc34, 0x30000020 },
++	{ 0xc38, 0x23808080 },
++	{ 0xc3c, 0x00002fd4 },
++	{ 0xc40, 0x1cf8403f },
++	{ 0xc44, 0x000100c7 },
++	{ 0xc48, 0xec060106 },
++	{ 0xc4c, 0x007f037f },
++	{ 0xc50, 0x00340020 },
++	{ 0xc54, 0x04008017 },
++	{ 0xc58, 0x00000020 },
++	{ 0xc5c, 0x00708492 },
++	{ 0xc60, 0x002e0200 },
++	{ 0xc64, 0x5012838b },
++	{ 0xc68, 0x47c006c7 },
++	{ 0xc6c, 0x00000035 },
++	{ 0xc70, 0x00000007 },
++	{ 0xc74, 0x020251a9 },
++	{ 0xc78, 0x0fe07f1f },
++	{ 0xc7c, 0x00b91612 },
++	{ 0xc80, 0x40000100 },
++	{ 0xc84, 0x32000000 },
++	{ 0xc88, 0x40000100 },
++	{ 0xc8c, 0xa0240000 },
++	{ 0xc90, 0x40000100 },
++	{ 0xc94, 0x00000000 },
++	{ 0xc98, 0x40000100 },
++	{ 0xc9c, 0x0000bdc8 },
++	{ 0xca0, 0x00000000 },
++	{ 0xca4, 0x098300a0 },
++	{ 0xca8, 0x00000000 },
++	{ 0xcac, 0x00f57b1a },
++	{ 0xcb0, 0x00000000 },
++	{ 0xcb4, 0x00000000 },
++	{ 0xcb8, 0x00000000 },
++	{ 0xcbc, 0x28100200 },
++	{ 0xcc0, 0x0010a3d0 },
++	{ 0xcc4, 0x00000f7d },
++	{ 0xcc8, 0x00000000 },
++	{ 0xccc, 0x00000000 },
++	{ 0xcd0, 0x00000000 },
++	{ 0xcd4, 0x00000000 },
++	{ 0xcd8, 0x64b22427 },
++	{ 0xcdc, 0x00766932 },
++	{ 0xce0, 0x40201001 },
++	{ 0xce4, 0x00000000 },
++	{ 0xce8, 0x40e04407 },
++	{ 0xcec, 0x2e572000 },
++	{ 0xcf0, 0x00000000 },
++	{ 0xcf4, 0x00000000 },
++	{ 0xcf8, 0x00000000 },
++	{ 0xd00, 0x000b0680 },
++	{ 0xd04, 0xc0000403 },
++	{ 0xd08, 0x0000907f },
++	{ 0xd0c, 0x00000201 },
++	{ 0xd10, 0x06288888 },
++	{ 0xd14, 0x8888366b },
++	{ 0xd18, 0x7d806db3 },
++	{ 0xd1c, 0x0000007f },
++	{ 0xd20, 0x167401b8 },
++	{ 0xd24, 0x0000018b },
++	{ 0xd28, 0xd513ff7d },
++	{ 0xd2c, 0xcc979975 },
++	{ 0xd30, 0x00008000 },
++	{ 0xd34, 0x40608000 },
++	{ 0xd38, 0xa8000000 },
++	{ 0xd3c, 0x00026ee2 },
++	{ 0xd40, 0x00000000 },
++	{ 0xd44, 0x00000000 },
++	{ 0xd48, 0x00000000 },
++	{ 0xd4c, 0x00000000 },
++	{ 0xd50, 0x6437140a },
++	{ 0xd54, 0x20500000 },
++	{ 0xd58, 0x16161616 },
++	{ 0xd5c, 0x70320064 },
++	{ 0xd60, 0x4653de60 },
++	{ 0xd64, 0x7e718a3c },
++	{ 0xd68, 0x00000103 },
++	{ 0xd6c, 0x00000000 },
++	{ 0xd70, 0x00000000 },
++	{ 0xd74, 0x00000000 },
++	{ 0xd78, 0x00000000 },
++	{ 0xd7c, 0x00000000 },
++	{ 0xd80, 0x00000000 },
++	{ 0xd84, 0x31310000 },
++	{ 0xd88, 0xf5b50000 },
++	{ 0xd8c, 0x00000000 },
++	{ 0xd90, 0x00000000 },
++	{ 0xd94, 0x44bbbb44 },
++	{ 0xd98, 0x44bb44ff },
++	{ 0xd9c, 0x06033688 },
++	{ 0xda0, 0x00000002 },
++	{ 0xda4, 0x00000000 },
++	{ 0xda8, 0x00000000 },
++	{ 0xdac, 0x00000000 },
++	{ 0xdb0, 0x00000000 },
++	{ 0xdb4, 0x00000000 },
++	{ 0xdb8, 0x00000000 },
++	{ 0xdbc, 0x00000000 },
++	{ 0xdc0, 0x00000000 },
++	{ 0xdc4, 0x00210000 },
++	{ 0xdc8, 0x00000200 },
++	{ 0xdcc, 0x0000000f },
++	{ 0xdd0, 0x00000020 },
++	{ 0xdd4, 0x00007f7f },
++	{ 0xdd8, 0xe5af1854 },
++	{ 0xddc, 0x000040ab },
++	{ 0xde0, 0x00000000 },
++	{ 0xde4, 0x00000000 },
++	{ 0xde8, 0x0002030b },
++	{ 0xdec, 0x0000a987 },
++	{ 0xdf0, 0x00005807 },
++	{ 0xdf4, 0x00000000 },
++	{ 0xdf8, 0x00000005 },
++	{ 0xe00, 0x00000000 },
++	{ 0xe04, 0x00000000 },
++	{ 0xe08, 0x00000000 },
++	{ 0xe0c, 0x000000ff },
++	{ 0xe10, 0x00000000 },
++	{ 0xe14, 0x00000000 },
++	{ 0xe18, 0x00000000 },
++	{ 0xe1c, 0x00000000 },
++	{ 0xe20, 0x00000000 },
++	{ 0xe24, 0x00200000 },
++	{ 0xe28, 0x00000000 },
++	{ 0xe2c, 0x00000000 },
++	{ 0xe30, 0x01007c00 },
++	{ 0xe34, 0x01004800 },
++	{ 0xe38, 0x10008c0f },
++	{ 0xe3c, 0x3c008c0f },
++	{ 0xe40, 0x01007c00 },
++	{ 0xe44, 0x00000000 },
++	{ 0xe48, 0x00000000 },
++	{ 0xe4c, 0x00000000 },
++	{ 0xe50, 0x01007c00 },
++	{ 0xe54, 0x01004800 },
++	{ 0xe58, 0x10008c0f },
++	{ 0xe5c, 0x3c008c0f },
++	{ 0xe60, 0x02100000 },
++	{ 0xe64, 0xbbbbbbbb },
++	{ 0xe68, 0x40404040 },
++	{ 0xe6c, 0x80408040 },
++	{ 0xe70, 0x80408040 },
++	{ 0xe74, 0x40404040 },
++	{ 0xe78, 0x00400040 },
++	{ 0xe7c, 0x40404040 },
++	{ 0xe80, 0x00ff0000 },
++	{ 0xe84, 0x80408040 },
++	{ 0xe88, 0x40404040 },
++	{ 0xe8c, 0x80408040 },
++	{ 0xe90, 0x00000000 },
++	{ 0xe94, 0x01000000 },
++	{ 0xe98, 0x00000000 },
++	{ 0xe9c, 0x00000000 },
++	{ 0xea0, 0x00000000 },
++	{ 0xea4, 0x01000000 },
++	{ 0xea8, 0x00000000 },
++	{ 0xeac, 0x00000000 },
++	{ 0xeb0, 0x00000000 },
++	{ 0xeb4, 0x01000000 },
++	{ 0xeb8, 0x00000000 },
++	{ 0xebc, 0x00000000 },
++	{ 0xec0, 0x00000000 },
++	{ 0xec4, 0x01000000 },
++	{ 0xec8, 0x00000000 },
++	{ 0xecc, 0x00000000 },
++	{ 0xed0, 0x80408040 },
++	{ 0xed4, 0x80408040 },
++	{ 0xed8, 0x80408040 },
++	{ 0xedc, 0xc040c040 },
++	{ 0xee0, 0xc040c040 },
++	{ 0xee4, 0x00400040 },
++	{ 0xee8, 0xd8001402 },
++	{ 0xeec, 0xc0000120 },
++	{ 0xef0, 0x02000b09 },
++	{ 0xef4, 0x00000001 },
++	{ 0xef8, 0x00000000 },
++	{ 0xf00, 0x00000300 },
++	{ 0xf04, 0x00000000 },
++	{ 0xf08, 0x0002030b },
++	{ 0xf0c, 0x0000a987 },
++	{ 0xf10, 0x00005807 },
++	{ 0xf14, 0x00000003 },
++	{ 0xf18, 0x00020002 },
++	{ 0xf1c, 0x8000001f },
++	{ 0xf20, 0x00000000 },
++	{ 0xf24, 0x00000000 },
++	{ 0xf28, 0x00000000 },
++	{ 0xf2c, 0x00000000 },
++	{ 0xf30, 0x00000000 },
++	{ 0xf34, 0x00000000 },
++	{ 0xf38, 0x00030155 },
++	{ 0xf3c, 0x0000003a },
++	{ 0xf40, 0x00000000 },
++	{ 0xf44, 0x00000000 },
++	{ 0xf48, 0x00030000 },
++	{ 0xf4c, 0x13000000 },
++	{ 0xf50, 0x00000010 },
++	{ 0xf54, 0x00000000 },
++	{ 0xf58, 0x00000000 },
++	{ 0xf5c, 0x00000000 },
++	{ 0xf60, 0x00000000 },
++	{ 0xf64, 0x00000000 },
++	{ 0xf68, 0x00000000 },
++	{ 0xf6c, 0x00000000 },
++	{ 0xf70, 0x00000000 },
++	{ 0xf74, 0x00000000 },
++	{ 0xf78, 0x00000000 },
++	{ 0xf7c, 0x00000000 },
++	{ 0xf80, 0x00000000 },
++	{ 0xf84, 0x00000000 },
++	{ 0xf88, 0x00000000 },
++	{ 0xf8c, 0x00000000 },
++	{ 0xf90, 0x00000002 },
++	{ 0xf94, 0x00000000 },
++	{ 0xf98, 0x00000000 },
++	{ 0xf9c, 0x00000000 },
++	{ 0xfa0, 0x00000000 },
++	{ 0xfa4, 0x0002030b },
++	{ 0xfa8, 0x0000a987 },
++	{ 0xfac, 0x00005807 },
++	{ 0xfb0, 0x00000000 },
++	{ 0xfb4, 0x00000000 },
++	{ 0xfb8, 0x00000000 },
++	{ 0xfbc, 0x00000000 },
++	{ 0xfc0, 0x00c02001 },
++	{ 0xfc4, 0x90063000 },
++	{ 0xfc8, 0x00000018 },
++	{ 0xfcc, 0x10003005 },
++	{ 0xfd0, 0x0000e5af },
++	{ 0xfd4, 0x00000000 },
++	{ 0xfd8, 0x00000000 },
++	{ 0xfdc, 0x00000000 },
++	{ 0xfe0, 0x00000000 },
++	{ 0xfe4, 0x00000000 },
++	{ 0xfe8, 0x00000000 },
++	{ 0xfec, 0x00000000 },
++	{ 0xff0, 0x00000000 },
++	{ 0xff4, 0x00000000 },
++	{ 0xff8, 0x00000000 },
++};
++
++static_assert(ARRAY_SIZE(rtl8192f_soc_phy_init_table) ==
++	      RTL8192F_PHY_TABLE_LEN,
++	      "PHY table rows out of sync with RTL8192F_PHY_TABLE_LEN");
++
++/* AGC_TAB: TX/RX gain ladder, original table order. */
++const struct rtl8192f_reg32val rtl8192f_soc_agc_table[] = {
++	{ 0xc78, 0x0ff0001f },
++	{ 0xc78, 0x0fe0011f },
++	{ 0xc78, 0x0fd0021f },
++	{ 0xc78, 0x0fc0031f },
++	{ 0xc78, 0x0fb0041f },
++	{ 0xc78, 0x0fa0051f },
++	{ 0xc78, 0x0f90061f },
++	{ 0xc78, 0x0f80071f },
++	{ 0xc78, 0x0f70081f },
++	{ 0xc78, 0x0f60091f },
++	{ 0xc78, 0x0f500a1f },
++	{ 0xc78, 0x0f400b1f },
++	{ 0xc78, 0x0f300c1f },
++	{ 0xc78, 0x0f200d1f },
++	{ 0xc78, 0x0f100e1f },
++	{ 0xc78, 0x0f000f1f },
++	{ 0xc78, 0x0ef0101f },
++	{ 0xc78, 0x0ee0111f },
++	{ 0xc78, 0x0ed0121f },
++	{ 0xc78, 0x0ec0131f },
++	{ 0xc78, 0x0eb0141f },
++	{ 0xc78, 0x0ea0151f },
++	{ 0xc78, 0x0e90161f },
++	{ 0xc78, 0x0e80171f },
++	{ 0xc78, 0x0e70181f },
++	{ 0xc78, 0x0e60191f },
++	{ 0xc78, 0x0e501a1f },
++	{ 0xc78, 0x0e401b1f },
++	{ 0xc78, 0x0e301c1f },
++	{ 0xc78, 0x0e201d1f },
++	{ 0xc78, 0x0e101e1f },
++	{ 0xc78, 0x0c401f1f },
++	{ 0xc78, 0x0c30201f },
++	{ 0xc78, 0x0c20211f },
++	{ 0xc78, 0x0c10221f },
++	{ 0xc78, 0x0c00231f },
++	{ 0xc78, 0x0a40241f },
++	{ 0xc78, 0x0a30251f },
++	{ 0xc78, 0x0a20261f },
++	{ 0xc78, 0x0a10271f },
++	{ 0xc78, 0x0a00281f },
++	{ 0xc78, 0x0820291f },
++	{ 0xc78, 0x08102a1f },
++	{ 0xc78, 0x08002b1f },
++	{ 0xc78, 0x06402c1f },
++	{ 0xc78, 0x06302d1f },
++	{ 0xc78, 0x06202e1f },
++	{ 0xc78, 0x06102f1f },
++	{ 0xc78, 0x0420301f },
++	{ 0xc78, 0x0410311f },
++	{ 0xc78, 0x0400321f },
++	{ 0xc78, 0x0240331f },
++	{ 0xc78, 0x0230341f },
++	{ 0xc78, 0x0220351f },
++	{ 0xc78, 0x0210361f },
++	{ 0xc78, 0x0200371f },
++	{ 0xc78, 0x0020381f },
++	{ 0xc78, 0x0010391f },
++	{ 0xc78, 0x00003a1f },
++	{ 0xc78, 0x00003b1f },
++	{ 0xc78, 0x00003c1f },
++	{ 0xc78, 0x00003d1f },
++	{ 0xc78, 0x00003e1f },
++	{ 0xc78, 0x00003f1f },
++	{ 0xc78, 0x0ff0401f },
++	{ 0xc78, 0x0fe0411f },
++	{ 0xc78, 0x0fd0421f },
++	{ 0xc78, 0x0fc0431f },
++	{ 0xc78, 0x0fb0441f },
++	{ 0xc78, 0x0fa0451f },
++	{ 0xc78, 0x0f90461f },
++	{ 0xc78, 0x0f80471f },
++	{ 0xc78, 0x0f70481f },
++	{ 0xc78, 0x0f60491f },
++	{ 0xc78, 0x0f504a1f },
++	{ 0xc78, 0x0f404b1f },
++	{ 0xc78, 0x0f304c1f },
++	{ 0xc78, 0x0f204d1f },
++	{ 0xc78, 0x0f104e1f },
++	{ 0xc78, 0x0f004f1f },
++	{ 0xc78, 0x0ef0501f },
++	{ 0xc78, 0x0ee0511f },
++	{ 0xc78, 0x0b70521f },
++	{ 0xc78, 0x0b60531f },
++	{ 0xc78, 0x0b50541f },
++	{ 0xc78, 0x0b40551f },
++	{ 0xc78, 0x0b30561f },
++	{ 0xc78, 0x0b20571f },
++	{ 0xc78, 0x0b10581f },
++	{ 0xc78, 0x0b00591f },
++	{ 0xc78, 0x0af05a1f },
++	{ 0xc78, 0x0ae05b1f },
++	{ 0xc78, 0x0ad05c1f },
++	{ 0xc78, 0x0ac05d1f },
++	{ 0xc78, 0x0ab05e1f },
++	{ 0xc78, 0x0aa05f1f },
++	{ 0xc78, 0x0a90601f },
++	{ 0xc78, 0x0a80611f },
++	{ 0xc78, 0x0a70621f },
++	{ 0xc78, 0x0a60631f },
++	{ 0xc78, 0x0a50641f },
++	{ 0xc78, 0x0a40651f },
++	{ 0xc78, 0x0a30661f },
++	{ 0xc78, 0x0a20671f },
++	{ 0xc78, 0x0a10681f },
++	{ 0xc78, 0x0a00691f },
++	{ 0xc78, 0x08206a1f },
++	{ 0xc78, 0x08106b1f },
++	{ 0xc78, 0x08006c1f },
++	{ 0xc78, 0x06406d1f },
++	{ 0xc78, 0x06306e1f },
++	{ 0xc78, 0x06206f1f },
++	{ 0xc78, 0x0610701f },
++	{ 0xc78, 0x0600711f },
++	{ 0xc78, 0x0420721f },
++	{ 0xc78, 0x0410731f },
++	{ 0xc78, 0x0400741f },
++	{ 0xc78, 0x0060751f },
++	{ 0xc78, 0x0050761f },
++	{ 0xc78, 0x0040771f },
++	{ 0xc78, 0x0030781f },
++	{ 0xc78, 0x0020791f },
++	{ 0xc78, 0x00107a1f },
++	{ 0xc78, 0x00007b1f },
++	{ 0xc78, 0x00007c1f },
++	{ 0xc78, 0x00007d1f },
++	{ 0xc78, 0x00007e1f },
++	{ 0xc78, 0x00007f1f },
++	{ 0xc50, 0x00340020 },
++	{ 0xc50, 0x00340020 },
++	{ 0xc58, 0x00000022 },
++	{ 0xc58, 0x00000020 },
++};
++
++/* The apply loop is driven by the *_TABLE_LEN macros, so a macro that is
++ * one short silently drops the last image row (that is how BB 0xff8 went
++ * unwritten on every boot); make the mismatch a build error.
++ */
++static_assert(ARRAY_SIZE(rtl8192f_soc_agc_table) == RTL8192F_AGC_TABLE_LEN,
++	      "AGC table rows out of sync with RTL8192F_AGC_TABLE_LEN");
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/tables_mac.c
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * RTL8197F (RTL8192F-SoC) init tables, ported row-by-row from the
++ * vendor PHYDM image files (rtl8192cd/phydm/rtl8197f/, MP image v37):
++ *   halhwimg8197f_mac.c  Array_MP_8197F_MAC_REG
++ *   halhwimg8197f_bb.c   Array_MP_8197F_AGC_TAB / Array_MP_8197F_PHY_REG
++ *   halhwimg8197f_rf.c   Array_MP_8197F_RadioA
++ *
++ * The vendor arrays are PHYDM conditional-lookup format: rows whose
++ * address has bit31 set are IF/ELSE/ENDIF condition markers and rows
++ * with bit30 set are negative-condition evaluators (they select the
++ * board package / cut variant).  For the RTL8197F SoC target (package
++ * type 0, cut A, internal PA - CheckPositive() never matches) the
++ * vendor apply loops end up taking the ELSE branch of every block, so
++ * the rows below are exactly the ELSE-branch content in original table
++ * order.  Rows with address 0xffe (RF table) are the vendor 50 ms
++ * settling-delay markers (phydm_regconfig8197f.c
++ * odm_ConfigRFReg_8197F()); the apply code turns them into delays.
++ */
++#include "rtl8192f_soc.h"
++
++/* 8-bit MAC register writes, original table order. */
++const struct rtl8192f_reg8val rtl8192f_soc_mac_init_table[] = {
++	{ 0x020, 0xbd },
++	{ 0x021, 0x1d },
++	{ 0x004, 0x12 },
++	{ 0x007, 0x14 },
++	{ 0x000, 0x92 },
++	{ 0x001, 0xb2 },
++	{ 0x024, 0x5b },
++	{ 0x078, 0xfb },
++	{ 0x079, 0x02 },
++	{ 0x07a, 0x30 },
++	{ 0x07b, 0x07 },
++	{ 0x420, 0x80 },
++	{ 0x421, 0x0f },
++	{ 0x428, 0x0a },
++	{ 0x429, 0x10 },
++	{ 0x430, 0x00 },
++	{ 0x431, 0x00 },
++	{ 0x432, 0x00 },
++	{ 0x433, 0x01 },
++	{ 0x434, 0x04 },
++	{ 0x435, 0x05 },
++	{ 0x436, 0x07 },
++	{ 0x437, 0x08 },
++	{ 0x43c, 0x04 },
++	{ 0x43d, 0x05 },
++	{ 0x43e, 0x07 },
++	{ 0x43f, 0x08 },
++	{ 0x440, 0x5d },
++	{ 0x441, 0x01 },
++	{ 0x442, 0x00 },
++	{ 0x444, 0x10 },
++	{ 0x445, 0xf0 },
++	{ 0x446, 0x01 },
++	{ 0x447, 0xfe },
++	{ 0x448, 0x00 },
++	{ 0x449, 0x00 },
++	{ 0x44a, 0x00 },
++	{ 0x44b, 0x40 },
++	{ 0x44c, 0x10 },
++	{ 0x44d, 0xf0 },
++	{ 0x44e, 0x3f },
++	{ 0x44f, 0x00 },
++	{ 0x450, 0x00 },
++	{ 0x451, 0x00 },
++	{ 0x452, 0x00 },
++	{ 0x453, 0x40 },
++	{ 0x455, 0x70 },
++	{ 0x45e, 0x04 },
++	{ 0x49c, 0x10 },
++	{ 0x49d, 0xf0 },
++	{ 0x49e, 0x00 },
++	{ 0x49f, 0x06 },
++	{ 0x4a0, 0xe0 },
++	{ 0x4a1, 0x03 },
++	{ 0x4a2, 0x00 },
++	{ 0x4a3, 0x40 },
++	{ 0x4a4, 0x15 },
++	{ 0x4a5, 0xf0 },
++	{ 0x4a6, 0x00 },
++	{ 0x4a7, 0x06 },
++	{ 0x4a8, 0xe0 },
++	{ 0x4a9, 0x00 },
++	{ 0x4aa, 0x00 },
++	{ 0x4ab, 0x00 },
++	{ 0x7da, 0x08 },
++	{ 0x1448, 0x06 },
++	{ 0x144a, 0x06 },
++	{ 0x144c, 0x06 },
++	{ 0x144e, 0x06 },
++	{ 0x4c8, 0xff },
++	{ 0x4c9, 0x08 },
++	/* 0x4ca/0x4cb are the global aggregation-number cap (rtw88
++	 * REG_MAX_AGGR_NUM) and they bind whatever W3 MAX_AGG_NUM asks
++	 * for.  The 8197F init image ships 0x10 here
++	 * (halhwimg8197f_mac.c 179-180); the factory firmware runs 0x20
++	 * (live 0x4c8 reads 0x202008ff).
++	 */
++	{ 0x4ca, 0x20 },
++	{ 0x4cb, 0x20 },
++	{ 0x4cc, 0xff },
++	{ 0x4cd, 0xff },
++	{ 0x4ce, 0x01 },
++	{ 0x4cf, 0x08 },
++	{ 0x500, 0x26 },
++	{ 0x501, 0xa2 },
++	{ 0x502, 0x2f },
++	{ 0x503, 0x00 },
++	{ 0x504, 0x28 },
++	{ 0x505, 0xa3 },
++	{ 0x506, 0x5e },
++	{ 0x507, 0x00 },
++	{ 0x508, 0x2b },
++	{ 0x509, 0xa4 },
++	{ 0x50a, 0x5e },
++	{ 0x50b, 0x00 },
++	{ 0x50c, 0x4f },
++	{ 0x50d, 0xa4 },
++	{ 0x50e, 0x00 },
++	{ 0x50f, 0x00 },
++	{ 0x512, 0x1c },
++	{ 0x514, 0x0a },
++	{ 0x516, 0x0a },
++	{ 0x521, 0x2f },
++	{ 0x525, 0x4f },
++	{ 0x551, 0x10 },
++	{ 0x559, 0x02 },
++	{ 0x55c, 0x50 },
++	{ 0x55d, 0xff },
++	{ 0x577, 0x0b },
++	{ 0x5be, 0x64 },
++	{ 0x604, 0x01 },
++	{ 0x605, 0x30 },
++	{ 0x607, 0x05 },
++	{ 0x608, 0x0e },
++	{ 0x609, 0x22 },
++	{ 0x60c, 0x18 },
++	{ 0x6a0, 0xff },
++	{ 0x6a1, 0xff },
++	{ 0x6a2, 0xff },
++	{ 0x6a3, 0xff },
++	{ 0x6a4, 0xff },
++	{ 0x6a5, 0xff },
++	{ 0x6de, 0x84 },
++	{ 0x620, 0xff },
++	{ 0x621, 0xff },
++	{ 0x622, 0xff },
++	{ 0x623, 0xff },
++	{ 0x624, 0xff },
++	{ 0x625, 0xff },
++	{ 0x626, 0xff },
++	{ 0x627, 0xff },
++	{ 0x638, 0x50 },
++	{ 0x63c, 0x0a },
++	{ 0x63d, 0x0a },
++	{ 0x63e, 0x0e },
++	{ 0x63f, 0x0e },
++	{ 0x640, 0x40 },
++	{ 0x642, 0x40 },
++	{ 0x643, 0x00 },
++	{ 0x652, 0xc8 },
++	{ 0x66e, 0x05 },
++	{ 0x700, 0x21 },
++	{ 0x701, 0x43 },
++	{ 0x702, 0x65 },
++	{ 0x703, 0x87 },
++	{ 0x708, 0x21 },
++	{ 0x709, 0x43 },
++	{ 0x70a, 0x65 },
++	{ 0x70b, 0x87 },
++	{ 0x718, 0x40 },
++};
++
++static_assert(ARRAY_SIZE(rtl8192f_soc_mac_init_table) ==
++		      RTL8192F_MAC_TABLE_LEN,
++	      "MAC table rows out of sync with RTL8192F_MAC_TABLE_LEN");
+--- /dev/null
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/tables_rf.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * RTL8197F (RTL8192F-SoC) init tables, ported row-by-row from the
++ * vendor PHYDM image files (rtl8192cd/phydm/rtl8197f/, MP image v37):
++ *   halhwimg8197f_mac.c  Array_MP_8197F_MAC_REG
++ *   halhwimg8197f_bb.c   Array_MP_8197F_AGC_TAB / Array_MP_8197F_PHY_REG
++ *   halhwimg8197f_rf.c   Array_MP_8197F_RadioA
++ *
++ * The vendor arrays are PHYDM conditional-lookup format: rows whose
++ * address has bit31 set are IF/ELSE/ENDIF condition markers and rows
++ * with bit30 set are negative-condition evaluators (they select the
++ * board package / cut variant).  For the RTL8197F SoC target (package
++ * type 0, cut A, internal PA - CheckPositive() never matches) the
++ * vendor apply loops end up taking the ELSE branch of every block, so
++ * the rows below are exactly the ELSE-branch content in original table
++ * order.  Rows with address 0xffe (RF table) are the vendor 50 ms
++ * settling-delay markers (phydm_regconfig8197f.c
++ * odm_ConfigRFReg_8197F()); the apply code turns them into delays.
++ */
++#include "rtl8192f_soc.h"
++
++/* RadioA: RF register writes; 0xffe rows are 50 ms delay markers. */
++const struct rtl8192f_rfregval rtl8192f_soc_radioa_table[] = {
++	{ 0x00, 0x00030000 },
++	{ 0x18, 0x00000c07 },
++	{ 0xca, 0x00002000 },
++	{ 0x81, 0x0000fc00 },
++	{ 0x82, 0x000003c0 },
++	{ 0x84, 0x00000005 },
++	{ 0x86, 0x000933a5 },
++	{ 0x87, 0x00000000 },
++	{ 0x88, 0x0007b030 },
++	{ 0x8e, 0x00064540 },
++	{ 0x8f, 0x000a8000 },
++	{ 0xdf, 0x000600 },
++	{ 0x51, 0x00000c1c },
++	{ 0x52, 0x0009a007 },
++	{ 0x53, 0x00018c47 },
++	{ 0x54, 0x00090034 },
++	{ 0x55, 0x00082000 },
++	{ 0x56, 0x0000880f },
++	{ 0x57, 0x0007f000 },
++	{ 0x58, 0x000603f0 },
++	{ 0x5a, 0x00050000 },
++	{ 0x5b, 0x00000006 },
++	{ 0x5c, 0x00000015 },
++	{ 0x65, 0x00020000 },
++	{ 0x6e, 0x00038319 },
++	{ 0xdf, 0x000600 },
++	{ 0xef, 0x00000100 },
++	{ 0x33, 0x000000a5 },
++	{ 0x33, 0x000040a8 },
++	{ 0x33, 0x000080e8 },
++	{ 0x33, 0x0000c4e6 },
++	{ 0x33, 0x00010de5 },
++	{ 0x33, 0x00014de8 },
++	{ 0x33, 0x00018deb },
++	{ 0x33, 0x0001cdee },
++	{ 0x33, 0x00020df1 },
++	{ 0x33, 0x00024df4 },
++	{ 0x33, 0x00028df7 },
++	{ 0xef, 0x00000000 },
++	{ 0xef, 0x00020000 },
++	{ 0x33, 0x00030026 },
++	{ 0x33, 0x00038026 },
++	{ 0x33, 0x00070026 },
++	{ 0x33, 0x00078026 },
++	{ 0xef, 0x00000000 },
++	{ 0xef, 0x00020000 },
++	{ 0x33, 0x00030021 },
++	{ 0xef, 0x00000000 },
++	{ 0xc9, 0x00000600 },
++	{ 0xb0, 0x0ffbc3 },
++	{ 0xb1, 0x033b87 },
++	{ 0xb2, 0x00033762 },
++	{ 0xb4, 0x0140f0 },
++	{ 0xb5, 0x00014000 },
++	{ 0xb6, 0x00012425 },
++	{ 0xb7, 0x010e8c },
++	{ 0xb8, 0x030fff },
++	{ 0xb9, 0x000c0008 },
++	{ 0xba, 0x00040005 },
++	{ 0xc2, 0x00002c01 },
++	{ 0xc3, 0x0000000b },
++	{ 0xc4, 0x00081e2f },
++	{ 0xc5, 0x0005c28f },
++	{ 0xc6, 0x000000a0 },
++	{ 0xc9, 0x00000600 },
++	{ 0xca, 0x00002000 },
++	{ 0xfe, 0x00000000 },
++	{ 0x18, 0x00008c07 },
++	{ 0xfe, 0x00000000 },
++	{ 0xfe, 0x00000000 },
++	{ 0xfe, 0x00000000 },
++	{ 0x00, 0x00035df5 },
++};
++
++static_assert(ARRAY_SIZE(rtl8192f_soc_radioa_table) ==
++		      RTL8192F_RF_TABLE_LEN,
++	      "RF table rows out of sync with RTL8192F_RF_TABLE_LEN");

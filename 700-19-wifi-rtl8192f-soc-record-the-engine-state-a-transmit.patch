@@ -1,0 +1,200 @@
+From 25b8f59606198a250b745c1b477445edf7a0653e Mon Sep 17 00:00:00 2001
+From: David Yang <mmyangfl@gmail.com>
+Date: Tue, 13 Oct 2026 11:23:23 +0800
+Subject: [PATCH 19/19] wifi: rtl8192f-soc: record the engine state a transmit halt
+ leaves
+
+The halt snapshot covers the ring indices, the FIFO page ledger, the
+interrupt state and the held descriptor.  Four more blocks are read on
+every watch pass and at the halt now, each because the hunt reached it
+and the answer settled a question the log could not settle before.
+
+REG_MACID_SLEEP (0x04D4) is the per-macid "station is dozing, hold its
+downlink" bitmap, and REG_MACID_RELEASE0 (0x1434) the one-packet release
+handshake that goes with it (SetMACIDSleep88XX, Hal88XXGen.c
+6908-6945; ReleaseOnePacket88XX, 6531-6550, which the RX path calls for
+this part at 8192cd_rx.c 11229-11241).  This driver neither marks a macid
+asleep nor releases one - mac80211 buffers for a sleeping station in
+software - and across a session with several halts both words read zero
+every time, so no downlink is being held for a dozing station by the
+hardware.
+
+REG_HMETFR (0x01CC) and the four mailbox words separate "the firmware
+stopped reading" from "the firmware has nothing to schedule": the
+box-full bits do fall while traffic runs (0x01 and 0x04 across passes,
+0x00 at a halt, 0x0f only immediately after all four boxes were written),
+so commands are still being taken while transmit is halted.  Clearing the
+boxes the way the vendor's second-stage recovery does (FillH2CCmd88XX,
+Hal88XXFirmware.c 2446-2468) reclaimed nothing.
+
+REG_TXDMA_OFFSET_CHK (0x020C) holds the TX engine's own read and write
+pointer reset in b12/b11.  Those bits are not self-clearing here, and
+holding them stops the engine outright: releasing them re-anchors both
+pointers instead of resuming the descriptor that was held - measured
+twice, 105/125 became 28/28 and 54/64 became 69/69, after which the
+reaper freed the never-transmitted descriptors as if they had completed.
+So the value is recorded, not poked.  Mainline rtw88 programs only b9
+(BIT_DROP_DATA_EN) in this register (rtw88xxa_power_on()); this part
+leaves it clear, as the 8192cd vendor does off its USB path.
+REG_HCI_CTRL (0x0300) carries the same interface reset on the HCI side
+(bit 20, which rtw88 pulses from its setup path) and reads constant
+through every halt.
+
+The held descriptor is decoded too - macid, queue selection and the
+programmed rate - so halt logs can be compared by frame class.  Group
+addressed frames (macid 0, at the BMC rate) and unicast HT frames
+(macid 1, MCS7) both appear as the held one, which is what rules out any
+single frame class as the trigger.
+
+Signed-off-by: David Yang <mmydf@gmail.com>
+---
+ .../net/wireless/realtek/rtl8192f-soc/fw.c    | 13 +++--
+ .../realtek/rtl8192f-soc/rtl8192f_soc.h       | 23 +++++++++
+ .../net/wireless/realtek/rtl8192f-soc/txrx.c  | 51 +++++++++++++++----
+ 3 files changed, 69 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/fw.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/fw.c
+@@ -521,13 +521,12 @@ out:
+  *
+  * The vendor waits on the REG_HMETFR box-full bit
+  * (CheckFwReadLastH2C88XX, Hal88XXFirmware.c 2356-2370) because on its
+- * chips the scheduler clears it after reading the box.  On the 8197F that
+- * bit is useless: it reads 0xf from boot and never drops, while the box
+- * itself still holds the command we wrote (0x1d0 read back
+- * 0x40810140 on the board) and REG_FWISR's FS_H2CCMD bit re-asserts
+- * on every box write
+- * and stays clear if nothing is written.  So the command does reach the
+- * firmware and FWISR is the only acknowledgment this part produces.
++ * chips the scheduler clears it after reading the box.  That bit moves here
++ * too, but it is not a usable gate for us: a box is reused before the flag
++ * of the previous command has necessarily fallen, so waiting for "the bit I
++ * just set went away" would race our own rotation.  REG_FWISR's FS_H2CCMD
++ * bit, by contrast, re-asserts on every box write and stays clear while
++ * nothing is written, which is what this loop polls.
+  *
+  * Budget is the vendor's 1200 polls of 10 us (FillH2CCmd88XX
+  * Hal88XXFirmware.c 2446-2468).
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/rtl8192f_soc.h
+@@ -189,9 +189,32 @@
+ #define REG_AXI_EXCEPT_TIME		0x1354
+ #define AXI_CAUSE_MASK			0x3f	/* CS[5:0]: the six latched causes */
+ #define REG_TXDMA_OFFSET_CHK		0x020C
++/* Fields of 0x020C (halmac_bit2.h 17202-17208, live for
++ * HALMAC_8197F_SUPPORT).  b12/b11 are *not* self-clearing: leaving
++ * them set holds the TX engine (measured: every read after an RMW-set
++ * returned them set, the fetch pointers re-anchored, and beacons
++ * started reporting TX errors) - so they are not a stall recovery.
++ * b9 is what mainline rtw88 sets in rtw88xxa_power_on(); this part
++ * leaves it clear, as the 8192cd vendor does off its USB path.
++ */
+ #define REG_RXDMA_STATUS		0x0288
+ #define REG_RXDMA_MODE		0x0290
+ #define REG_SYS_CFG			0x00F0
++/* Per-MACID "this station is dozing, its downlink is held" bitmap: macid
++ * 0..31 live in this word (the vendor's next regions are 0x04D0, 0x0484 and
++ * 0x0488 - HalCfg.h 706-708, SetMACIDSleep88XX Hal88XXGen.c 6908-6945).
++ * Its partner REG_MACID_RELEASE0 is a handshake: the driver sets the bit of
++ * the macid it wants served one packet and waits for the hardware to clear
++ * it (ReleaseOnePacket88XX, Hal88XXGen.c 6531-6550), and the RX path does
++ * that on this part (8192cd_rx.c 11229-11241, the branch listing
++ * VERSION_8197F).  This driver marks no macid asleep and never releases one
++ * - mac80211 buffers for dozing stations in software instead - so both
++ * words are read on every watch pass and every halt, to see whether the
++ * hardware is doing it by itself.
++ */
++#define REG_MACID_SLEEP			0x04D4
++#define REG_MACID_RELEASE0			0x1434
++#define REG_MACID_RELEASE_SETTING		0x1444
+ 
+ /* ------------------------------------------------------------------ */
+ /* 88XX "new BD" ring registers (0x300 block).  All offsets per vendor */
+--- a/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
++++ b/drivers/net/wireless/realtek/rtl8192f-soc/txrx.c
+@@ -1978,14 +1978,22 @@ static void rtl8192f_tx_page_ledger(stru
+ static void rtl8192f_tx_tail_state(struct rtl8192f_soc_priv *priv, char *buf,
+ 				   size_t size)
+ {
+-	scnprintf(buf, size,
+-		  " txq=0x%08x free_tail=0x%03lx bcn_head=0x%04x req=0x%02x clk=0x%08x",
+-		  rtl8192f_read32(priv, REG_FWHW_TXQ_CTRL),
+-		  FIELD_GET(FW_FREE_TAIL,
+-			    rtl8192f_read32(priv, REG_CPU_MGQ_INFO)),
+-		  rtl8192f_read16(priv, REG_FIFOPAGE_CTRL_2),
++	int n;
++
++	n = scnprintf(buf, size, " txq=%#010x hci=%#010x ftail=%#06lx bcn=%#08x",
++		      rtl8192f_read32(priv, REG_FWHW_TXQ_CTRL),
++		      rtl8192f_read32(priv, REG_HCI_CTRL),
++		      FIELD_GET(FW_FREE_TAIL,
++				rtl8192f_read32(priv, REG_CPU_MGQ_INFO)),
++		      rtl8192f_read16(priv, REG_FIFOPAGE_CTRL_2));
++	scnprintf(buf + n, size - n,
++		  " req=%#06x clk=%#010x txdma=%#010x sleep=%#010x rel=%#010x metfr=%#06x",
+ 		  rtl8192f_read8(priv, REG_DIS_TXREQ_CLR),
+-		  rtl8192f_read32(priv, REG_SYS_CLK_CTRL));
++		  rtl8192f_read32(priv, REG_SYS_CLK_CTRL),
++		  rtl8192f_read32(priv, REG_TXDMA_OFFSET_CHK),
++		  rtl8192f_read32(priv, REG_MACID_SLEEP),
++		  rtl8192f_read32(priv, REG_MACID_RELEASE0),
++		  rtl8192f_read8(priv, REG_HMETFR));
+ }
+ 
+ static void rtl8192f_tx_halt_report(struct rtl8192f_soc_priv *priv, int stalled,
+@@ -2003,7 +2011,7 @@ static void rtl8192f_tx_halt_report(stru
+ 	char line[160];
+ 	char pages[80];
+ 	char pend[80];
+-	char tail[96];
++	char tail[160];
+ 	size_t poff = 0;
+ 	int off, ret, n;
+ 	u32 i;
+@@ -2105,14 +2113,35 @@ static void rtl8192f_tx_halt_report(stru
+ 		return;
+ 	}
+ 
+-	if (have_desc)
++	if (have_desc) {
++		u32 w1 = get_unaligned_le32(stuck_desc + 4);
++		u32 w4 = get_unaligned_le32(stuck_desc + 16);
++
+ 		dev_err(dev, "tx halt: stalled slot %u txbd %*ph desc %*ph\n",
+ 			slot, (int)sizeof(stuck_bd), &stuck_bd,
+ 			(unsigned int)sizeof(stuck_desc), stuck_desc);
+-	else
++		/* Who the held frame is aimed at, read out of the descriptor the
++		 * driver wrote: the parks have covered unicast and group, both
++		 * security settings and both aggregation states, so the next
++		 * question is whether they all share a macid or a programmed
++		 * rate.
++		 */
++		dev_err(dev, "tx halt: stuck frame macid=%lu qsel=%lu rate=%lu\n",
++			FIELD_GET(TXD_W1_MACID, w1),
++			FIELD_GET(TXD_W1_QSEL, w1),
++			FIELD_GET(TXD_W4_DATARATE, w4));
++	} else {
+ 		dev_err(dev,
+ 			"tx halt: stalled slot %u txbd %*ph, no skb in it\n",
+ 			slot, (int)sizeof(stuck_bd), &stuck_bd);
++	}
++	dev_err(dev,
++		"tx halt: h2c metfr=0x%02x boxes 0x%08x 0x%08x 0x%08x 0x%08x\n",
++		rtl8192f_read8(priv, REG_HMETFR),
++		rtl8192f_read32(priv, REG_HMEBOX(0)),
++		rtl8192f_read32(priv, REG_HMEBOX(1)),
++		rtl8192f_read32(priv, REG_HMEBOX(2)),
++		rtl8192f_read32(priv, REG_HMEBOX(3)));
+ 	dev_err(dev, "tx halt: last consumed slot %u txbd %*ph\n", last,
+ 		(int)sizeof(last_bd), &last_bd);
+ 
+@@ -2236,7 +2265,7 @@ void rtl8192f_tx_watch(struct work_struc
+ 	unsigned long flags;
+ 	char causes_str[48];
+ 	char pages[80];
+-	char tail[96];
++	char tail[160];
+ 	char pend[80];
+ 	size_t pend_off;
+ 	bool armed = false, beat;
